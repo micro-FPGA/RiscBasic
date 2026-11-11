@@ -1,6 +1,6 @@
 # RiscBasic — Language Specification
 
-**Draft 0.12** — 11 November 2026 (7 AG)
+**Draft 0.22** — 11 November 2026 (7 AG)
 Language design: Antti Lukats (Identor #1). Drafting: Claude (Identor #9).
 
 ---
@@ -31,6 +31,7 @@ STACK  256             ' top of RAM, grows down
 - `CLOCK` is required whenever timing statements are used. A missing clock is a compile error, not a silent bug.
 - Literals: `123`, `&HFF`, `0xFF`, `&B1010`. `_` is allowed as a separator: `&H4000_0000`.
 - Comments start with `'` or `REM`.
+- `:` separates statements on one line: `s = 0 : FOR i = 1 TO 4 : s = s + i : NEXT`. Blocks may open and close on the same line. A `:` inside `( )` or `[ ]` (as in `R10[7:4]`) and the width in `REG ... : 8` are not separators. `name:` at the start of a line is a label, unless `name` is a SUB or FUNCTION (then it is a call). `REM` after a `:` comments out the rest of the line.
 
 ---
 
@@ -94,6 +95,7 @@ ALIAS BUTTON = GPIO.IN.0
 
 - `: 8` / `: 16` gives the register width (default 32). It selects `SB` / `SH` / `SW` and `LBU` / `LHU` / `LW`.
 - `SETS` and `CLEARS` tell the compiler it can change single bits with one store instead of read-modify-write.
+- `READONLY` registers cannot be written. `WRITEONLY` registers are read through a RAM copy (section 3.2.2).
 - `BIT` and `FIELD` give names to parts of a register: `FIELD MODE = CTRL[2:0]`.
 
 ### 3.2.1 Inverted bits and fields (NOT)
@@ -125,6 +127,30 @@ ALIAS RESET_N = NOT GPIO.OUT.7   ' NOT also works in ALIAS
 - `NOT` applied twice cancels: `ALIAS X = NOT PORT.LED_N` is the raw pin.
 - `NOT` needs a bit or field; a whole register cannot be declared inverted.
 
+### 3.2.2 Write-only registers (WRITEONLY)
+
+Some output registers cannot be read back: a read returns 0, garbage, or the input pins. `WRITEONLY` makes the compiler keep a copy of such a register in RAM (a *shadow*):
+
+```basic
+DEVICE GPIO AT &H4000_0000
+  REG OUT AT +0 WRITEONLY
+  REG SET AT +4 SETS OUT
+  REG CLR AT +8 CLEARS OUT
+  BIT LED = OUT.3
+END DEVICE
+
+LED = 1                    ' set bit 3 in the shadow, then write the whole shadow to OUT
+PRINT HEX GPIO.OUT         ' reads the shadow, not the hardware
+```
+
+- Every write goes to the shadow and to the register. Every read, including the read-modify-write behind bit and field assignments, `IF`/`WAIT` tests, `NOT` bits and `INPUT` targets, uses the shadow.
+- Bit and field changes on a `WRITEONLY` register are done in the shadow, and the whole shadow is then written to the register (not through `SET`/`CLR`).
+- Writing a register declared `SETS` or `CLEARS` for a `WRITEONLY` register also updates the shadow, so the shadow stays correct.
+- The shadow is one RAM variable of the register's width, created only when the register is used. It appears in the ELF symbol table as `DEVICE.REG.shadow`.
+- The shadow starts at 0 (RAM is cleared at startup). If the hardware resets to another value, write the whole register once at the start of the program.
+- Raw `MEMn(addr)` access does not use the shadow.
+- `READONLY` and `WRITEONLY` together are an error.
+
 ### 3.3 Variables
 
 ```basic
@@ -133,7 +159,7 @@ DIM flags AS BYTE           ' in RAM
 DIM buf(16) AS BYTE         ' array in RAM
 ```
 
-Types: `BIT`, `BYTE`, `HALF` (16-bit), `WORD` (32-bit), and signed `SBYTE`, `SHALF`, `SWORD`.
+Types: `BIT`, `BYTE`, `HALF` (16-bit), `WORD` (32-bit), and signed `SBYTE`, `SHALF`, `SWORD`. Text: `STRING * n` (section 5.2).
 
 - **RAM variables always live in RAM.** Every read is a load and every write is a store, so the listing is predictable. `count = count + 1` on a RAM variable is load, add, store.
 - **Register variables** (`IN Rn`) always live in their register.
@@ -208,18 +234,60 @@ For RAM `BYTE` and `HALF` variables, the final `sb` / `sh` discards the bits abo
 
 ---
 
+### 5.2 Strings
+
+RiscBasic has no heap. Every string is a fixed-size, zero-terminated `BYTE` buffer.
+
+```basic
+DIM name AS STRING * 20               ' 20 bytes: up to 19 characters and the 0
+
+FUNCTION Hex8(v AS WORD) AS STRING * 12
+  RETURN "0x" + HEX$(v)
+END FUNCTION
+
+FUNCTION Greet(who AS STRING) AS STRING * 32
+  RETURN "Hello, " + who + "!"
+END FUNCTION
+
+name = "item " + DEC$(n) + " at " + Hex8(addr) + CHR$(33)
+PRINT Greet(name), 13, 10
+```
+
+- **`DIM name AS STRING * n`** is the same as `DIM name(n) AS BYTE`, but marks the array as text. Any `BYTE` array can be used as a string.
+- **String expressions** join terms with `+`. A term is `"text"`, a `STRING` or `BYTE` array, a string `FUNCTION` call, a `STRING` parameter, `CHR$(expr)`, `DEC$(expr)` or `HEX$(expr)`. `DEC$` and `HEX$` format like `DEC` and `HEX` in `PRINT`; `CHR$` gives one character.
+- **Assignment** `buffer = string expression` builds the text in the buffer. It is cut at the buffer size and always zero-terminated. `s = "x" + s` works: when the buffer itself may be read during the build, the text is built in a scratch buffer and then copied.
+- **`FUNCTION f(...) AS STRING * n`** returns text in its own result buffer of n bytes. `RETURN expression` sets it and returns. A string `FUNCTION` that ends without `RETURN`, or leaves with `EXIT FUNCTION`, returns empty text.
+- **`STRING` parameters** (`who AS STRING`) pass a pointer to existing text: a literal, a buffer, a string `FUNCTION` result or another `STRING` parameter. They are read-only. An argument is a single term, not a `+` expression.
+- **`PRINT`** takes string expressions as items: `PRINT Greet(name) + "?", 13, 10`. It prints the terms one after another and needs no buffer.
+- Strings cannot be used as numbers, and numbers cannot be assigned to strings: use `DEC$`, `HEX$` or `CHR$`.
+- **`LEN(string expression)`** is the number of characters: up to the 0, or the end of the buffer. For joined strings it adds up the lengths of the terms, without building them. Text of known length (`"abc"`, `CHR$`, `HEX$`) is counted at compile time; `LEN(DEC$(x))` is not supported.
+- **Comparison** `=`, `<>`, `<`, `>`, `<=`, `>=` between two strings: `IF name = "Bob" THEN`. Byte by byte, unsigned; a shorter prefix is less (`"ab" < "abc"`). Each side is one term: text, a `STRING` or `BYTE` array (read up to its size), a string `FUNCTION` call or a `STRING` parameter; compare a joined (`+`) string by assigning it first. Both sides calling the same string `FUNCTION` is an error (one result buffer). A one-character text against a number stays a number comparison: `IF c = "A"` with a `BYTE` `c` compares with 65.
+- **`LEFT$(s, n)`**, **`RIGHT$(s, n)`** and **`MID$(s, start [, n])`** give the first n, the last n, or n characters from position `start` (counting from 1; without n, to the end). Out-of-range values give shorter or empty text, never an error: `MID$(s, 0)` and a `start` past the end are empty. They are string terms: usable in assignments, `RETURN`, `PRINT`, `LEN`, comparisons and as `STRING` arguments. The source is a single term (text, `STRING` or `BYTE` array, string `FUNCTION`, `STRING` parameter); nest them through a variable. `PRINT` and `LEN` work on a substring directly; for a comparison or an argument it is copied into a scratch buffer, so only one side of a comparison can be a substring, and the substring of a `STRING` parameter must be assigned to a `STRING` first. With constant text and numbers the result is computed at compile time.
+- **`INSTR([start,] s, find)`** is the position (from 1) of `find` in `s`, searching from `start` (default 1); 0 if not found. An empty `find` gives `start` (or 0 past the end).
+- **`VAL(s)`** converts text to a signed number: leading spaces are skipped, then an optional `+` or `-`, then decimal digits, or hex / binary digits after `&H` / `0x` / `&B` / `0b` (as in RiscBasic literals). The first character that is not a digit of that base ends the number: `VAL("42abc")` is 42. No digits gives 0; values wrap at 32 bits. `s` is a single term, including `LEFT$` / `RIGHT$` / `MID$`: `n = VAL(MID$(line, 3))`. `VAL` of constant text is computed at compile time.
+- Each string `FUNCTION`, and the main program, has its own scratch buffer for overlapping builds, so a function that needs scratch space can be called while the main program is building in its scratch buffer.
+- A string `FUNCTION` result is a single static buffer: each call overwrites the previous result. Using results one after another (`Pad(7) + "/" + Pad(42)`) and nesting (`Greet(Greet("x"))`) work; a recursive string `FUNCTION` does not.
+- Do not build strings in an interrupt handler while the main program may be building one; the build state is shared.
+
 ## 6. Control flow
 
 ```basic
 IF cond THEN ... ELSEIF cond THEN ... ELSE ... END IF
-IF cond THEN statement            ' single-line form
+IF cond THEN statement [ELSE statement]   ' single-line form
 WHILE cond ... WEND
 DO ... LOOP [UNTIL cond]
+REPEAT ... UNTIL cond              ' body runs at least once
 FOR i = 0 TO 15 [STEP 1] ... NEXT
-SELECT CASE x ... CASE 1, 2 ... CASE ELSE ... END SELECT
+SELECT CASE x ... CASE 1, 2 ... CASE 5 TO 9, 12 ... CASE IS > 100 ... CASE ELSE ... END SELECT
 GOTO label
-EXIT DO | EXIT FOR | EXIT WHILE
+EXIT DO | EXIT FOR | EXIT WHILE | EXIT REPEAT
 ```
+
+The single-line `IF` takes the statements after `THEN` and optionally after `ELSE`, separated by `:`: `IF ok THEN PRINT "a" : PRINT "b" ELSE PRINT "c" : PRINT "d"`. Everything after `THEN` up to its `ELSE` belongs to `THEN`, everything after the `ELSE` belongs to `ELSE`, so an `END IF` on such a line is an error. Either part can itself be a single-line `IF`. An `ELSE` belongs to the nearest `IF` that has no `ELSE` yet: in `IF a THEN IF b THEN x = 1 ELSE x = 2`, the `ELSE` runs when `a` is true and `b` is false.
+
+`CASE` takes a list of constants and constant ranges: `CASE 1 TO 5`, `CASE 7, 10 TO 12, 20`, `CASE "a" TO "z"`. A range includes both ends and works for negative and unsigned values; `CASE 5 TO 1` (low end last) is an error. `CASE IS op value` compares with `=`, `<>`, `<`, `>`, `<=` or `>=`: `CASE IS < 0, 5 TO 9, IS > 100`. The comparison is signed if the `SELECT` expression is signed (`SBYTE`, `SHALF`, `SWORD`), otherwise unsigned, as for all comparisons. The first matching `CASE` runs; there is no fall-through.
+
+`REPEAT ... UNTIL cond` runs the body, then tests `cond` at the end and repeats until it is true. It is the same as `DO ... LOOP UNTIL cond`, written Pascal-style; `UNTIL` on its own line closes the innermost `REPEAT`.
 
 ### 6.1 FOR loop counters
 
@@ -460,7 +528,17 @@ LOOP
 | 20 | Input | `INPUT [dev,] "prompt", CHR / DEC / HEX target`; device needs `RXREADY` and `RXDATA` or `DATA` | 0.10 |
 | 21 | Line input | `LINE INPUT [dev,] ["prompt",] buffer [, length]` into a zero-terminated `BYTE` array | 0.11 |
 | 22 | Printing text buffers | A `BYTE` array name in `PRINT` prints it as zero-terminated text, bounded by its size | 0.12 |
+| 23 | Write-only registers | `WRITEONLY` keeps a RAM shadow; reads and bit changes use it | 0.13 |
+| 24 | REPEAT loop | `REPEAT ... UNTIL cond` and `EXIT REPEAT` | 0.14 |
+| 25 | CASE ranges | `CASE low TO high`, mixed with single values | 0.15 |
+| 26 | CASE IS | `CASE IS op value`; signed or unsigned like the SELECT expression | 0.16 |
+| 27 | Single-line ELSE | `IF c THEN s ELSE s`; ELSE binds to the nearest IF without one | 0.17 |
+| 28 | Statement separator | `:` between statements; single-line IF takes the rest of the line (QBasic rules) | 0.18 |
+| 29 | Strings | `STRING * n` buffers, string expressions with `+`, `CHR$` / `DEC$` / `HEX$`, `FUNCTION ... AS STRING * n`, `STRING` parameters | 0.19 |
+| 30 | LEN and string comparison | `LEN(s)`; `=` `<>` `<` `>` `<=` `>=` on strings, unsigned byte order | 0.20 |
+| 31 | Substrings and search | `LEFT$`, `RIGHT$`, `MID$` (from 1), `INSTR` (from 1, 0 = not found) | 0.21 |
+| 32 | VAL | Text to signed number: decimal, `&H` / `0x`, `&B` / `0b` | 0.22 |
 
 ## 14. Open questions
 
-None at Draft 0.12.
+None at Draft 0.22.

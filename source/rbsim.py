@@ -12,6 +12,7 @@ Test devices:
   UART1  0x40001100  DATA +0 (write = output, read = next input character),
                      STATUS +4 (bit 0 = TX busy, bit 1 = RX empty: both active-low ready)
   PLAIN  0x40002000  4 KB of plain read/write registers
+  WO     0x40003000  write-only OUT +0, SET +4, CLR +8; every read returns 0x55AA55AA
 """
 
 import sys
@@ -143,6 +144,8 @@ class Sim:
         self.uart_out = {}          # UART data address -> characters, to check which UART was used
         self.uart_raw = []          # raw values written to UART data registers
         self.rx = {0: [], 1: []}    # input queues for UART0 and UART1
+        self.wout = 0               # state of the write-only WO.OUT register
+        self.wout_log = []          # every value WO.OUT took
         self.gpio_out = 0
         self.gpio_in = 0
         self.steps = 0
@@ -162,7 +165,9 @@ class Sim:
 
     def load(self, addr, size, signed):
         addr &= MASK
-        if addr == 0x40000000:
+        if 0x40003000 <= addr < 0x40003010:
+            v = 0x55AA55AA                  # write-only device: reads return garbage
+        elif addr == 0x40000000:
             v = self.gpio_out
         elif addr == 0x40000004:
             v = self.gpio_in
@@ -187,7 +192,15 @@ class Sim:
     def store(self, addr, size, val):
         addr &= MASK
         val &= (1 << (8 * size)) - 1
-        if addr in (0x40001000, 0x40001100):
+        if addr == 0x40003000:
+            self.wout = val
+        elif addr == 0x40003004:
+            self.wout |= val
+        elif addr == 0x40003008:
+            self.wout &= ~val & MASK
+        if 0x40003000 <= addr < 0x4000300C:
+            self.wout_log.append(self.wout)
+        elif addr in (0x40001000, 0x40001100):
             self.out.append(chr(val & 0xFF))
             self.uart_out.setdefault(addr, []).append(chr(val & 0xFF))
             self.uart_raw.append(val)

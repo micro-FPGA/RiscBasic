@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-RiscBasic compiler v0.16
+RiscBasic compiler v0.23
 (v0.2: compressed instructions for RV32IC / RV32EC; v0.3: branch shrinking and far branches;
- v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers; v0.14: WRITEONLY registers with shadow; v0.15: REPEAT ... UNTIL; v0.16: CASE ranges)
+ v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers; v0.14: WRITEONLY registers with shadow; v0.15: REPEAT ... UNTIL; v0.16: CASE ranges; v0.17: CASE IS; v0.18: single-line ELSE binds to the nearest IF; v0.19: ':' separator; v0.20: strings; v0.21: LEN and string comparison; v0.22: LEFT$ RIGHT$ MID$ INSTR; v0.23: VAL)
 
-Compiles RiscBasic (spec: RiscBasic-Spec.md, Draft 0.15) directly to RISC-V
+Compiles RiscBasic (spec: RiscBasic-Spec.md, Draft 0.22) directly to RISC-V
 machine code in a single pass, without a linker.
 
     python riscbasic.py program.bas [-o outbase] [--no-lst]
@@ -22,7 +22,7 @@ import os
 import re
 import sys
 
-VERSION = '0.16'
+VERSION = '0.23'
 
 # ---------------------------------------------------------------- registers
 
@@ -783,7 +783,7 @@ TOKEN_RE = re.compile(r'''
   | (?P<hex>(?:&[Hh]|0[xX])[0-9A-Fa-f_]+)
   | (?P<bin>(?:&[Bb]|0[bB])[01_]+)
   | (?P<num>[0-9][0-9_]*[Kk]?)
-  | (?P<id>[A-Za-z_][A-Za-z0-9_]*)
+  | (?P<id>[A-Za-z_][A-Za-z0-9_]*\$?)
   | (?P<op><>|<=|>=|[-+*/=<>()\[\],:;.])
 ''', re.X)
 
@@ -860,12 +860,13 @@ DECLARATIONS = {'TARGET', 'CLOCK', 'CPI', 'CODE', 'RAM', 'STACK', 'CONST',
                 'DEVICE', 'ALIAS', 'DIM', 'CONSOLE'}
 KEYWORDS = DECLARATIONS | {
     'IF', 'THEN', 'ELSEIF', 'ELSE', 'END', 'WHILE', 'WEND', 'DO', 'LOOP', 'REPEAT',
-    'UNTIL', 'FOR', 'TO', 'STEP', 'NEXT', 'EXIT', 'GOTO', 'SELECT', 'CASE',
+    'UNTIL', 'FOR', 'TO', 'STEP', 'NEXT', 'EXIT', 'GOTO', 'SELECT', 'CASE', 'IS',
     'SUB', 'FUNCTION', 'RETURN', 'CALL', 'ON', 'IRQ', 'WAIT', 'DELAY_US',
     'DELAY_MS', 'PRINT', 'INPUT', 'LINE', 'HEX', 'DEC', 'CHR', 'SHL', 'SHR', 'SAR', 'ROL', 'ROR',
     'ATOMIC', 'ASM', 'LET', 'AND', 'OR', 'XOR', 'NOT', 'MOD', 'AS', 'IN',
     'AT', 'SIZE', 'REG', 'BIT', 'FIELD', 'READONLY', 'WRITEONLY', 'SETS', 'CLEARS',
-    'MEM8', 'MEM16', 'MEM32'}
+    'MEM8', 'MEM16', 'MEM32', 'STRING', 'CHR$', 'DEC$', 'HEX$', 'LEN',
+    'LEFT$', 'RIGHT$', 'MID$', 'INSTR', 'VAL'}
 
 
 class Obj:
@@ -896,6 +897,8 @@ class Obj:
         self.shadow = None        # loc only: the shadow RAM variable (created on first use)
         self.sets = None          # loc only: register whose bits this register sets (SETS)
         self.clears = None        # loc only: register whose bits this register clears (CLEARS)
+        self.isstr = False        # array declared AS STRING * n
+        self.strref = False       # reg only: STRING parameter, a pointer to zero-terminated text
         self.index = None
         self.count = 0
         self.__dict__.update(kw)
@@ -911,6 +914,33 @@ class Node:
         self.signed = signed
         self.isbool = isbool
         self.width = width
+
+
+def val_text(text):
+    """VAL at compile time: spaces, sign, then decimal digits or &H / 0x / &B / 0b; wraps at 32 bits."""
+    i, n = 0, len(text)
+    while i < n and text[i] == ' ':
+        i += 1
+    neg = False
+    if i < n and text[i] in '+-':
+        neg = text[i] == '-'
+        i += 1
+    base = 10
+    pre = text[i:i + 2].lower()
+    if pre in ('&h', '0x'):
+        base, i = 16, i + 2
+    elif pre in ('&b', '0b'):
+        base, i = 2, i + 2
+    elif pre[:1] == '&':
+        return 0
+    v = 0
+    while i < n:
+        d = int(text[i], 36) if text[i].isalnum() and text[i].isascii() else 99
+        if d >= base:
+            break
+        v = (v * base + d) & 0xFFFFFFFF
+        i += 1
+    return (-v) & 0xFFFFFFFF if neg else v
 
 
 def fold(op, a, b):
@@ -1242,6 +1272,377 @@ __putbuf_{d}_x:
 '''.format(d=dev), ['__putc_' + dev]
 
 
+def rt_sbegin(sb):
+    """Start building text in the buffer at t1 of t2 bytes: empty it."""
+    return '''
+__sbegin:
+    addi sp, sp, -4
+    sw a0, 0(sp)
+    li a0, 0x{sb:X}
+    sw t1, 0(a0)
+    add t2, t1, t2
+    addi t2, t2, -1
+    sw t2, 4(a0)
+    sb zero, 0(t1)
+    lw a0, 0(sp)
+    addi sp, sp, 4
+    ret
+'''.format(sb=sb), []
+
+
+def rt_sapp_chr(sb):
+    """Append the character in t1 if there is room; keep the text zero-terminated."""
+    return '''
+__sapp_chr:
+    addi sp, sp, -8
+    sw a0, 0(sp)
+    sw a1, 4(sp)
+    li a0, 0x{sb:X}
+    lw a1, 0(a0)
+    lw t2, 4(a0)
+    bgeu a1, t2, __sapp_chr_x
+    sb t1, 0(a1)
+    addi a1, a1, 1
+    sb zero, 0(a1)
+    sw a1, 0(a0)
+__sapp_chr_x:
+    lw a0, 0(sp)
+    lw a1, 4(sp)
+    addi sp, sp, 8
+    ret
+'''.format(sb=sb), []
+
+
+def rt_sapp_str():
+    """Append zero-terminated text at t1, at most t2 characters."""
+    return '''
+__sapp_str:
+    addi sp, sp, -12
+    sw ra, 0(sp)
+    sw a1, 4(sp)
+    sw a2, 8(sp)
+    mv a1, t1
+    mv a2, t2
+__sapp_str_l:
+    beqz a2, __sapp_str_x
+    lbu t1, 0(a1)
+    beqz t1, __sapp_str_x
+    jal ra, __sapp_chr
+    addi a1, a1, 1
+    addi a2, a2, -1
+    j __sapp_str_l
+__sapp_str_x:
+    lw ra, 0(sp)
+    lw a1, 4(sp)
+    lw a2, 8(sp)
+    addi sp, sp, 12
+    ret
+''', ['__sapp_chr']
+
+
+def rt_sapp_dec():
+    """DEC$: the decimal routine of PRINT, appending instead of sending."""
+    text, _ = rt_putdec('SB')
+    return text.replace('__putdec_SB', '__sapp_dec').replace('__putc_SB', '__sapp_chr'), ['__sapp_chr', '__pow10']
+
+
+def rt_sapp_hex():
+    """HEX$: the hex routine of PRINT, appending instead of sending."""
+    text, _ = rt_puthex('SB')
+    return text.replace('__puthex_SB', '__sapp_hex').replace('__putc_SB', '__sapp_chr'), ['__sapp_chr']
+
+
+def rt_strlen():
+    """t1 = length of the text at t1, at most t2 characters."""
+    return '''
+__strlen:
+    addi sp, sp, -8
+    sw a0, 0(sp)
+    sw a1, 4(sp)
+    mv a0, t1
+    li t1, 0
+__strlen_l:
+    beq t1, t2, __strlen_x
+    lbu a1, 0(a0)
+    beqz a1, __strlen_x
+    addi t1, t1, 1
+    addi a0, a0, 1
+    j __strlen_l
+__strlen_x:
+    lw a0, 0(sp)
+    lw a1, 4(sp)
+    addi sp, sp, 8
+    ret
+''', []
+
+
+def rt_strcmp():
+    """Compare the text at t1 and t2 (limits at 0(sp) and 4(sp)); t1 = -1, 0 or 1."""
+    return '''
+__strcmp:
+    addi sp, sp, -20
+    sw a0, 0(sp)
+    sw a1, 4(sp)
+    sw a2, 8(sp)
+    sw a3, 12(sp)
+    sw a4, 16(sp)
+    lw a2, 20(sp)
+    lw a3, 24(sp)
+    mv a0, t1
+    mv a1, t2
+__strcmp_l:
+    li a4, 0
+    beqz a2, __strcmp_a
+    lbu a4, 0(a0)
+__strcmp_a:
+    li t1, 0
+    beqz a3, __strcmp_b
+    lbu t1, 0(a1)
+__strcmp_b:
+    bne a4, t1, __strcmp_d
+    beqz a4, __strcmp_e
+    addi a0, a0, 1
+    addi a1, a1, 1
+    addi a2, a2, -1
+    addi a3, a3, -1
+    j __strcmp_l
+__strcmp_d:
+    sltu t1, a4, t1
+    beqz t1, __strcmp_g
+    li t1, -1
+    j __strcmp_x
+__strcmp_g:
+    li t1, 1
+    j __strcmp_x
+__strcmp_e:
+    li t1, 0
+__strcmp_x:
+    lw a0, 0(sp)
+    lw a1, 4(sp)
+    lw a2, 8(sp)
+    lw a3, 12(sp)
+    lw a4, 16(sp)
+    addi sp, sp, 20
+    ret
+''', []
+
+
+def rt_mid(name, action, result_len=False):
+    """LEFT$ / RIGHT$ / MID$ on the text at t1 (at most t2 characters).
+
+    Stack: 0(sp) = offset from 0, 4(sp) = count, 8(sp) = 1 for RIGHT$ (offset from the end).
+    action: what to do with the substring (address t1, at most t2 characters), e.g. append or print.
+    result_len: return the substring length in t1 instead (for LEN).
+    """
+    return '''
+{n}:
+    addi sp, sp, -16
+    sw ra, 0(sp)
+    sw a0, 4(sp)
+    sw a1, 8(sp)
+    sw a2, 12(sp)
+    mv a0, t1
+    jal ra, __strlen
+    lw a1, 16(sp)
+    lw a2, 20(sp)
+    lw t2, 24(sp)
+    beqz t2, {n}_m
+    li a1, 0
+    bgeu a2, t1, {n}_m
+    sub a1, t1, a2
+{n}_m:
+    li t2, 0
+    bgeu a1, t1, {n}_x
+    sub t2, t1, a1
+    bgeu a2, t2, {n}_c
+    mv t2, a2
+{n}_c:
+    add t1, a0, a1
+    {action}
+{n}_x:
+    {result}
+    lw ra, 0(sp)
+    lw a0, 4(sp)
+    lw a1, 8(sp)
+    lw a2, 12(sp)
+    addi sp, sp, 16
+    ret
+'''.format(n=name, action=action, result='mv t1, t2' if result_len else '')
+
+
+def rt_instr():
+    """t1 = 1-based position of the text at t2 in the text at t1, 0 if not found.
+
+    Stack: 0(sp) = limit of t1, 4(sp) = limit of t2, 8(sp) = start offset from 0.
+    """
+    return '''
+__instr:
+    addi sp, sp, -32
+    sw ra, 0(sp)
+    sw a0, 4(sp)
+    sw a1, 8(sp)
+    sw a2, 12(sp)
+    sw a3, 16(sp)
+    sw a4, 20(sp)
+    sw a5, 24(sp)
+    mv a0, t1
+    mv a1, t2
+    lw t2, 32(sp)
+    jal ra, __strlen
+    mv a2, t1
+    mv t1, a1
+    lw t2, 36(sp)
+    jal ra, __strlen
+    mv a3, t1
+    lw a4, 40(sp)
+    bltu a2, a3, __instr_no
+    sub a5, a2, a3
+__instr_i:
+    bltu a5, a4, __instr_no
+    li t2, 0
+__instr_j:
+    beq t2, a3, __instr_yes
+    add t1, a0, a4
+    add t1, t1, t2
+    lbu t1, 0(t1)
+    add a2, a1, t2
+    lbu a2, 0(a2)
+    bne t1, a2, __instr_n
+    addi t2, t2, 1
+    j __instr_j
+__instr_n:
+    addi a4, a4, 1
+    j __instr_i
+__instr_yes:
+    addi t1, a4, 1
+    j __instr_x
+__instr_no:
+    li t1, 0
+__instr_x:
+    lw ra, 0(sp)
+    lw a0, 4(sp)
+    lw a1, 8(sp)
+    lw a2, 12(sp)
+    lw a3, 16(sp)
+    lw a4, 20(sp)
+    lw a5, 24(sp)
+    addi sp, sp, 32
+    ret
+''', ['__strlen']
+
+
+def rt_val():
+    """t1 = number in the text at t1 (at most t2 characters): spaces, sign, decimal or &H / 0x / &B / 0b."""
+    return '''
+__val:
+    addi sp, sp, -24
+    sw a0, 0(sp)
+    sw a1, 4(sp)
+    sw a2, 8(sp)
+    sw a3, 12(sp)
+    sw a4, 16(sp)
+    sw a5, 20(sp)
+    mv a0, t1
+    mv a1, t2
+    li a2, 0
+    li a3, 0
+__val_sp:
+    beqz a1, __val_end
+    lbu t1, 0(a0)
+    li t2, 32
+    bne t1, t2, __val_sign
+    addi a0, a0, 1
+    addi a1, a1, -1
+    j __val_sp
+__val_sign:
+    li t2, 45
+    bne t1, t2, __val_plus
+    li a3, 1
+    j __val_adv
+__val_plus:
+    li t2, 43
+    bne t1, t2, __val_pre
+__val_adv:
+    addi a0, a0, 1
+    addi a1, a1, -1
+__val_pre:
+    li t1, 0
+    beqz a1, __val_p1
+    lbu t1, 0(a0)
+__val_p1:
+    li a5, 0
+    li t2, 2
+    bltu a1, t2, __val_p2
+    lbu a5, 1(a0)
+__val_p2:
+    ori a5, a5, 32
+    li a4, 10
+    li t2, 38
+    beq t1, t2, __val_amp
+    li t2, 48
+    bne t1, t2, __val_dig
+    li t2, 120
+    beq a5, t2, __val_hex
+    li t2, 98
+    beq a5, t2, __val_bin
+    j __val_dig
+__val_amp:
+    li t2, 104
+    beq a5, t2, __val_hex
+    li t2, 98
+    beq a5, t2, __val_bin
+    j __val_end
+__val_hex:
+    li a4, 16
+    j __val_skip
+__val_bin:
+    li a4, 2
+__val_skip:
+    addi a0, a0, 2
+    addi a1, a1, -2
+__val_dig:
+    beqz a1, __val_end
+    lbu t1, 0(a0)
+    addi t2, t1, -48
+    li a5, 10
+    bltu t2, a5, __val_have
+    ori t2, t1, 32
+    addi t2, t2, -87
+    bltu t2, a5, __val_end
+__val_have:
+    bgeu t2, a4, __val_end
+    li a5, 10
+    bne a4, a5, __val_shift
+    slli a5, a2, 3
+    slli a2, a2, 1
+    add a2, a2, a5
+    j __val_add
+__val_shift:
+    slli a2, a2, 1
+    li a5, 16
+    bne a4, a5, __val_add
+    slli a2, a2, 3
+__val_add:
+    add a2, a2, t2
+    addi a0, a0, 1
+    addi a1, a1, -1
+    j __val_dig
+__val_end:
+    mv t1, a2
+    beqz a3, __val_r
+    sub t1, zero, t1
+__val_r:
+    lw a0, 0(sp)
+    lw a1, 4(sp)
+    lw a2, 8(sp)
+    lw a3, 12(sp)
+    lw a4, 16(sp)
+    lw a5, 20(sp)
+    addi sp, sp, 24
+    ret
+''', []
+
+
 def rt_puts(dev):
     return '''
 __puts_{d}:
@@ -1379,6 +1780,9 @@ class Compiler:
         self.has_irq = False
         self.uses_ra = False      # user code reads or writes RA (R1) directly
         self.console = None       # default device for PRINT (CONSOLE declaration)
+        self.building = 0         # > 0 while a string expression is being built
+        self.sb_addr = None       # RAM address of the string builder state (current, end)
+        self.scratch = {}         # scratch buffer symbol -> size (main program: __strtmp, FUNCTION f: __tmp_F)
         self.ram_syms = []        # (name, address, size) of RAM variables, for the ELF symbol table
         self.started = False
         self.in_device = None
@@ -1409,7 +1813,8 @@ class Compiler:
         self.warnings.append('%s:%d: warning: %s' % (self.fname, self.line, msg))
 
     def prescan(self, lines):
-        sig_re = re.compile(r'^\s*(SUB|FUNCTION)\s+([A-Za-z_]\w*)\s*(?:\((.*)\))?\s*(?:AS\s+([A-Za-z]+))?\s*$', re.I)
+        sig_re = re.compile(r'^\s*(SUB|FUNCTION)\s+([A-Za-z_]\w*)\s*(?:\(([^)]*)\))?\s*'
+                            r'(?:AS\s+([A-Za-z]+)(?:\s*\*\s*(\w+))?)?\s*(?::.*)?$', re.I)
         for n, raw in enumerate(lines, 1):
             s = strip_comment(raw)
             if re.match(r'^\s*ON\s+IRQ\b', s, re.I):
@@ -1427,22 +1832,29 @@ class Compiler:
                     if not pm:
                         raise RBError("bad parameter '%s'" % p.strip(), n)
                     typ = (pm.group(2) or 'WORD').upper()
-                    if typ not in TYPES:
+                    if typ not in TYPES and typ != 'STRING':
                         raise RBError("unknown type '%s'" % typ, n)
                     params.append((pm.group(1).upper(), typ))
             rtype = (m.group(4) or 'WORD').upper()
-            if rtype not in TYPES:
+            strsize = None
+            if rtype == 'STRING':
+                if kind != 'FUNCTION' or not m.group(5):
+                    raise RBError('a string FUNCTION needs a size: AS STRING * 16', n)
+                strsize = m.group(5).upper()
+                w, sg, isbit = 8, False, False
+            elif rtype not in TYPES:
                 raise RBError("unknown type '%s'" % rtype, n)
-            w, sg, isbit = TYPES[rtype]
+            else:
+                w, sg, isbit = TYPES[rtype]
             if len(params) > len(PARAM_REGS):
                 raise RBError('%s %s: at most %d parameters' % (kind, name, len(PARAM_REGS)), n)
             busy = set(PARAM_REGS[i] for i in range(len(params)))
-            if kind == 'FUNCTION':
+            if kind == 'FUNCTION' and strsize is None:
                 busy.add(A0)
             self.funcs[name] = {'kind': kind, 'name': name, 'params': params,
                                 'label': 'sub_' + name, 'signed': sg,
                                 'width': 1 if isbit else w, 'rtype': rtype,
-                                'busy': busy}
+                                'busy': busy, 'str': strsize, 'buf': None}
 
     def process(self, raw):
         if self.in_asm:
@@ -1546,6 +1958,18 @@ class Compiler:
         return self.p_cmp()
 
     def p_cmp(self):
+        if self.is_str_start():                # string comparison, e.g. name = "Bob"
+            save = self.i
+            try:
+                L = self.str_expr()
+                tok = self.peek()
+                if tok.kind == 'op' and tok.val in CMP_OPS:
+                    self.i += 1
+                    if self.is_str_start():
+                        return Node('strcmp', (tok.val, L, self.str_expr()), isbool=True)
+            except RBError:
+                pass
+            self.i = save                      # not a string comparison: "A" = c is a number
         l = self.p_shift()
         tok = self.peek()
         if tok.kind == 'op' and tok.val in CMP_OPS:
@@ -1596,6 +2020,45 @@ class Compiler:
             n = self.expr()
             self.expect_op(')')
             return n
+        if tok.kind == 'id' and tok.up == 'VAL':
+            self.i += 1
+            self.expect_op('(')
+            t = self.str_term()
+            self.expect_op(')')
+            if t[0] in ('chr', 'dec', 'hex'):
+                raise RBError('VAL: build CHR$ / DEC$ / HEX$ into a STRING first')
+            if t[0] == 'lit':
+                return Node('const', s32(val_text(t[1])), signed=True)
+            return Node('val', t, signed=True)
+        if tok.kind == 'id' and tok.up == 'INSTR':
+            self.i += 1
+            self.expect_op('(')
+            start = None
+            if not self.is_str_start():
+                start = self.expr()
+                self.expect_op(',')
+            hay = self.str_term()
+            self.expect_op(',')
+            needle = self.str_term()
+            self.expect_op(')')
+            for t in (hay, needle):
+                if t[0] in ('chr', 'dec', 'hex'):
+                    raise RBError('INSTR: build CHR$ / DEC$ / HEX$ into a STRING first')
+            if hay[0] == 'lit' and needle[0] == 'lit' and (start is None or start.k == 'const'):
+                st = 0 if start is None else start.a - 1
+                if st < 0:
+                    return Node('const', 0)
+                return Node('const', hay[1].find(needle[1], st) + 1 if st <= len(hay[1]) else 0)
+            return Node('instr', (start, hay, needle))
+        if tok.kind == 'id' and tok.up == 'LEN':
+            self.i += 1
+            self.expect_op('(')
+            terms = self.str_expr()
+            self.expect_op(')')
+            fixed = sum(self.fixed_len(t) for t in terms if t[0] in ('lit', 'chr', 'hex'))
+            if all(t[0] in ('lit', 'chr', 'hex') for t in terms):
+                return Node('const', fixed)
+            return Node('strlen', terms)
         if tok.kind == 'id':
             return self.ref()
         raise RBError("value expected, found '%s'" % tok)
@@ -1650,7 +2113,11 @@ class Compiler:
         o = self.lookup_var(u)
         node = None
         if o is not None:
+            if o.strref:
+                raise RBError("'%s' is a STRING parameter; use it in PRINT or a string expression" % tok.val)
             if o.kind == 'array':
+                if o.isstr and not self.isop('('):
+                    raise RBError("'%s' is a STRING; use it in PRINT or a string expression" % tok.val)
                 self.expect_op('(')
                 idx = self.expr()
                 self.expect_op(')')
@@ -1696,7 +2163,9 @@ class Compiler:
             f = self.funcs[u]
             if f['kind'] != 'FUNCTION':
                 raise RBError("SUB %s has no value; use FUNCTION" % u)
-            args = self.arglist(True)
+            if f['str']:
+                raise RBError("%s returns a STRING; use it in PRINT or a string expression" % u)
+            args = self.call_args(u, True)
             return Node('call', (u, args), signed=f['signed'], width=f['width'])
         else:
             raise RBError("unknown name '%s'" % tok.val)
@@ -1718,6 +2187,25 @@ class Compiler:
             else:
                 break
         return node
+
+    def call_args(self, name, paren):
+        """Arguments of a SUB / FUNCTION call; STRING parameters take a string term."""
+        params = self.funcs[name]['params']
+        args = []
+        if paren:
+            self.expect_op('(')
+            if self.accept_op(')'):
+                return args
+        elif self.at_end() or self.isop(':'):
+            return args
+        while True:
+            typ = params[len(args)][1] if len(args) < len(params) else 'WORD'
+            args.append(('sterm', self.str_term()) if typ == 'STRING' else self.expr())
+            if not self.accept_op(','):
+                break
+        if paren:
+            self.expect_op(')')
+        return args
 
     def arglist(self, paren):
         args = []
@@ -1876,6 +2364,19 @@ class Compiler:
             return dst
         if k == 'call':
             self.gen_call(n.a[0], n.a[1], True)
+            em.mv(dst, T1)
+            return dst
+        if k == 'strlen':
+            return self.gen_strlen(n.a, dst)
+        if k == 'strcmp':
+            return self.gen_strcmp(n.a, dst)
+        if k == 'instr':
+            return self.gen_instr(n.a, dst)
+        if k == 'val':
+            em.mv(T1, self.str_address(n.a))
+            em.li(T2, self.str_limit(n.a))
+            self.need('__val')
+            em.ins('jal', RA, '__val')
             em.mv(dst, T1)
             return dst
         return self.gen_bin(n, dst)
@@ -2365,8 +2866,15 @@ class Compiler:
         if 'E' in self.ext and len(args) > 5:
             raise RBError('RV32E allows at most 5 parameters')
         used = set(PARAM_REGS[i] for i in range(len(args)))
-        if f['kind'] == 'FUNCTION':
+        if f['kind'] == 'FUNCTION' and not f['str']:
             used.add(A0)
+        if self.building:                      # a string is being built: keep its state across the call
+            b, ofs = self.addr_base(self.sb_addr)
+            em.ins('lw', T1, ofs, b)
+            self.push(T1)
+            b, ofs = self.addr_base(self.sb_addr + 4)
+            em.ins('lw', T1, ofs, b)
+            self.push(T1)
         live = set(o.reg for o in self.vars.values() if o.kind == 'reg')
         if self.cur_func:
             live |= set(PARAM_REGS[i] for i in range(len(self.cur_func['params'])))
@@ -2375,7 +2883,10 @@ class Compiler:
             self.push(r)
         consts, pushed = {}, []
         for i, a in enumerate(args):
-            if a.k == 'const':
+            if isinstance(a, tuple):
+                self.push(self.str_address(a[1]))
+                pushed.append(i)
+            elif a.k == 'const':
                 consts[i] = a.a
             else:
                 self.push(self.gen(a, T1))
@@ -2389,21 +2900,55 @@ class Compiler:
             em.mv(T1, A0)
         for r in reversed(save):
             self.pop(r)
+        if self.building:
+            self.pop(T2)
+            b, ofs = self.addr_base(self.sb_addr + 4)
+            em.ins('sw', T2, ofs, b)
+            self.pop(T2)
+            b, ofs = self.addr_base(self.sb_addr)
+            em.ins('sw', T2, ofs, b)
 
     # ---- statements
 
     def stmt(self, toks):
-        self.t, self.i = toks, 0
-        tok = self.peek()
-        if tok.kind == 'id' and self.peek(1).kind == 'op' and self.peek(1).val == ':' \
-                and tok.up not in KEYWORDS:
+        """One source line: an optional label, then statements separated by ':'."""
+        if len(toks) > 1 and toks[0].kind == 'id' and toks[1].kind == 'op' and toks[1].val == ':' \
+                and toks[0].up not in KEYWORDS and toks[0].up not in self.funcs:
             self.ensure_start()
-            self.em.label('L_' + tok.up)
-            self.i = 2
-            if self.at_end():
+            self.em.label('L_' + toks[0].up)
+            toks = toks[2:]
+        self.stmt_list(toks)
+
+    @staticmethod
+    def next_colon(toks):
+        """Index of the first ':' outside () and [], or len(toks)."""
+        depth = 0
+        for j, tk in enumerate(toks):
+            if tk.kind == 'op':
+                if tk.val in '([':
+                    depth += 1
+                elif tk.val in ')]':
+                    depth -= 1
+                elif tk.val == ':' and depth == 0:
+                    return j
+        return len(toks)
+
+    def stmt_list(self, toks):
+        """Statements separated by ':'. A single-line IF takes the rest of the list, as in QBasic:
+        everything after THEN (up to its ELSE) belongs to the IF."""
+        while toks:
+            tok = toks[0]
+            if tok.kind == 'op' and tok.val == ':':
+                toks = toks[1:]
+                continue
+            if tok.kind == 'id' and tok.up == 'REM':
                 return
-            tok = self.peek()
-        self.dispatch()
+            if tok.kind == 'id' and tok.up == 'IF':
+                self.sub_stmt(toks)
+                return
+            j = self.next_colon(toks)
+            self.sub_stmt(toks[:j])
+            toks = toks[j + 1:]
 
     def dispatch(self):
         tok = self.peek()
@@ -2419,7 +2964,7 @@ class Compiler:
         elif kw in self.funcs and not self.isop_at(1, '='):
             self.i += 1
             paren = self.isop('(')
-            self.gen_call(kw, self.arglist(paren), False)
+            self.gen_call(kw, self.call_args(kw, paren), False)
         else:
             self.st_let()
         self.expect_end()
@@ -2566,6 +3111,24 @@ class Compiler:
             typ = 'WORD'
             if self.accept_kw('AS'):
                 typ = self.expect_id().up
+                if typ == 'STRING':
+                    if count:
+                        raise RBError('use DIM name AS STRING * n, without (n)')
+                    self.expect_op('*')
+                    n = self.const_expr()
+                    if n < 2:
+                        raise RBError('STRING * %d: needs room for at least one character and the 0' % n)
+                    if self.ram_base is None:
+                        raise RBError('RAM must be declared before DIM')
+                    if self.iskw('IN'):
+                        raise RBError('a STRING cannot live in a register')
+                    o = Obj('array', u, addr=self.alloc_ram(n, 1), width=8, count=n, isstr=True)
+                    qual = '%s.%s' % (self.cur_func['name'], u) if self.cur_func else u
+                    self.ram_syms.append((qual, o.addr, n))
+                    (self.scope if self.scope is not None else self.vars)[u] = o
+                    if not self.accept_op(','):
+                        break
+                    continue
                 if typ not in TYPES:
                     raise RBError("unknown type '%s'" % typ)
             w, sg, isbit = TYPES[typ]
@@ -2679,6 +3242,17 @@ class Compiler:
     # assignment and commands
 
     def st_let(self):
+        tok = self.peek()
+        if tok.kind == 'id' and self.isop_at(1, '='):
+            o = self.lookup_var(tok.up)
+            if o is not None and o.strref:
+                raise RBError("STRING parameter '%s' is read-only" % tok.val)
+            if o is not None and o.kind == 'array':
+                if o.width != 8 or o.isbit:
+                    raise RBError("text can only be assigned to a STRING or BYTE array, '%s' is not one" % tok.val)
+                self.i += 2
+                self.emit_build(o, self.str_expr())
+                return
         dn = self.ref()
         if dn.k != 'obj':
             raise RBError('cannot assign to a constant')
@@ -2794,16 +3368,28 @@ class Compiler:
             return
         rest = self.t[self.i:]
         self.i = len(self.t)
-        k = next((j for j, tk in enumerate(rest) if tk.kind == 'id' and tk.up == 'ELSE'), None)
+        while rest and rest[0].kind == 'op' and rest[0].val == ':':
+            rest = rest[1:]
+        # ELSE belongs to the nearest IF without one: skip the ELSEs of IFs nested in the THEN part
+        k, open_ifs = None, 0
+        for j, tk in enumerate(rest):
+            if tk.kind == 'id' and tk.up == 'IF':
+                open_ifs += 1
+            elif tk.kind == 'id' and tk.up == 'ELSE':
+                if open_ifs:
+                    open_ifs -= 1
+                else:
+                    k = j
+                    break
         then_t, else_t = (rest, None) if k is None else (rest[:k], rest[k + 1:])
         nxt = self.newlabel()
         self.gen_branch(cond, nxt, False)
-        self.sub_stmt(then_t)
+        self.stmt_list(then_t)
         if else_t is not None:
             end = self.newlabel()
             em.j(end)
             em.label(nxt)
-            self.sub_stmt(else_t)
+            self.stmt_list(else_t)
             em.label(end)
         else:
             em.label(nxt)
@@ -2935,6 +3521,8 @@ class Compiler:
             raise RBError('EXIT FOR, DO, WHILE, REPEAT, SUB or FUNCTION expected')
         for b in reversed(self.blocks):
             if b['type'] == kw:
+                if kw == 'FUNCTION' and self.cur_func['str']:
+                    self.clear_result()           # EXIT FUNCTION without RETURN: empty text
                 self.em.j(b['exit'])
                 return
         raise RBError('EXIT %s outside %s' % (kw, kw))
@@ -2944,7 +3532,7 @@ class Compiler:
         n = self.expr()
         slot = Obj('ram', '__select', addr=self.alloc_ram(4, 4), width=32)
         self.assign_mem(slot, n)
-        self.blocks.append({'type': 'SELECT', 'slot': slot, 'end': self.newlabel(),
+        self.blocks.append({'type': 'SELECT', 'slot': slot, 'signed': n.signed, 'end': self.newlabel(),
                             'next': None, 'cases': 0, 'else': False})
 
     def st_case(self):
@@ -2968,8 +3556,26 @@ class Compiler:
         em.ins('lw', T1, ofs, base)
         body = self.newlabel()
         b['next'] = self.newlabel()
-        for j, (lo, hi) in enumerate(items):
+        for j, item in enumerate(items):
             last = j == len(items) - 1
+            if item[0] == 'IS':
+                op, v = item[1], item[2]
+                if v == 0:
+                    r = ZERO
+                else:
+                    em.li(T2, v)
+                    r = T2
+                # branch to the body when true (or to the next CASE when false, for the last item)
+                t, f, swap = {'=': ('beq', 'bne', False), '<>': ('bne', 'beq', False),
+                              '<': ('blt', 'bge', False), '>=': ('bge', 'blt', False),
+                              '>': ('blt', 'bge', True), '<=': ('bge', 'blt', True)}[op]
+                mn = f if last else t
+                if mn in ('blt', 'bge') and not b['signed']:
+                    mn += 'u'
+                x, y = (r, T1) if swap else (T1, r)
+                em.ins(mn, x, y, b['next'] if last else body)
+                continue
+            lo, hi = item
             if lo == hi:
                 if lo == 0:
                     r = ZERO
@@ -3003,7 +3609,13 @@ class Compiler:
         em.label(body)
 
     def case_item(self):
-        """CASE value or CASE low TO high; returns (low, high)."""
+        """CASE value, CASE low TO high or CASE IS op value.
+        Returns (low, high) or ('IS', op, value)."""
+        if self.accept_kw('IS'):
+            tok = self.next()
+            if tok.kind != 'op' or tok.val not in CMP_OPS:
+                raise RBError('CASE IS needs a comparison: =, <>, <, >, <= or >=')
+            return ('IS', tok.val, self.const_expr())
         lo = self.const_expr()
         hi = lo
         if self.accept_kw('TO'):
@@ -3033,14 +3645,28 @@ class Compiler:
         self.push(RA)
         self.scope = {}
         for j, (pn, typ) in enumerate(f['params']):
+            if typ == 'STRING':
+                self.scope[pn] = Obj('reg', pn, reg=PARAM_REGS[j], strref=True)
+                continue
             w, sg, isbit = TYPES[typ]
             self.scope[pn] = Obj('reg', pn, reg=PARAM_REGS[j], width=32 if isbit else w, signed=sg, isbit=isbit)
+        if f['str']:
+            self.str_buf(f)
         self.cur_func = f
         self.blocks.append({'type': kind, 'exit': self.newlabel(), 'skip': skip, 'name': u, 'start': start})
+
+    def clear_result(self):
+        """A string FUNCTION that ends without RETURN returns empty text. Not done on entry:
+        the argument may be the function's own result buffer, as in Greet(Greet(x))."""
+        buf = self.str_buf(self.cur_func)
+        b, ofs = self.addr_base(buf.addr)
+        self.em.ins('sb', ZERO, ofs, b)
 
     def end_sub(self, kind):
         em = self.em
         b = self.top_block(kind)
+        if kind == 'FUNCTION' and self.cur_func['str']:
+            self.clear_result()                   # falling off the end: empty text
         self.blocks.pop()
         em.label(b['exit'])
         self.pop(RA)
@@ -3055,7 +3681,10 @@ class Compiler:
         b = next((b for b in reversed(self.blocks) if b['type'] in ('SUB', 'FUNCTION', 'IRQ')), None)
         if b is None:
             raise RBError('RETURN outside SUB, FUNCTION or IRQ')
-        if b['type'] == 'FUNCTION':
+        if b['type'] == 'FUNCTION' and self.cur_func['str']:
+            buf = self.str_buf(self.cur_func)
+            self.emit_build(buf, self.str_expr())
+        elif b['type'] == 'FUNCTION':
             n = self.expr()
             self.gen(n, A0, True)
             f = self.cur_func
@@ -3067,7 +3696,7 @@ class Compiler:
         u = self.expect_id().up
         if u not in self.funcs:
             raise RBError("unknown SUB '%s'" % u)
-        self.gen_call(u, self.arglist(self.isop('(')), False)
+        self.gen_call(u, self.call_args(u, self.isop('(')), False)
 
     def st_on(self):
         em = self.em
@@ -3124,6 +3753,446 @@ class Compiler:
     def st_asm(self):
         self.expect_end()
         self.in_asm = True
+
+    # ---- strings
+
+    def str_buf(self, f):
+        """Result buffer of a string FUNCTION, allocated on first use."""
+        if f['buf'] is None:
+            size = f['str']
+            if size.isdigit():
+                n = int(size)
+            elif size in self.consts:
+                n = self.consts[size]
+            else:
+                raise RBError("FUNCTION %s: size '%s' is not a number or CONST" % (f['name'], size))
+            if n < 2:
+                raise RBError('FUNCTION %s: STRING * %d needs room for one character and the 0' % (f['name'], n))
+            if self.ram_base is None:
+                raise RBError('RAM must be declared before a string FUNCTION is used')
+            f['buf'] = Obj('array', f['name'] + '.result', addr=self.alloc_ram(n, 1), width=8,
+                           count=n, isstr=True)
+            self.ram_syms.append((f['name'] + '.result', f['buf'].addr, n))
+        return f['buf']
+
+    def is_str_start(self):
+        """Does a string term start here (text, STRING / BYTE array, string FUNCTION, CHR$ ...)?"""
+        tok = self.peek()
+        if tok.kind == 'str':
+            return True
+        if tok.kind != 'id':
+            return False
+        if tok.up in ('CHR$', 'DEC$', 'HEX$', 'LEFT$', 'RIGHT$', 'MID$'):
+            return True
+        f = self.funcs.get(tok.up)
+        if f is not None:
+            return bool(f['str'])
+        o = self.lookup_var(tok.up)
+        if o is None:
+            return False
+        return o.strref or (o.kind == 'array' and not self.isop_at(1, '('))
+
+    def str_term(self):
+        tok = self.next()
+        if tok.kind == 'str':
+            bad = [ch for ch in tok.val if ord(ch) > 255]
+            if bad:
+                raise RBError("character '%s' is not in the 8-bit character set" % bad[0])
+            return ('lit', tok.val)
+        if tok.kind == 'id' and tok.up in ('LEFT$', 'RIGHT$', 'MID$'):
+            self.expect_op('(')
+            src = self.str_term()
+            if src[0] not in ('lit', 'arr', 'call', 'ptr'):
+                raise RBError('%s: the source must be text, a STRING, a string FUNCTION or a STRING parameter; '
+                              'assign a nested one first' % tok.up)
+            self.expect_op(',')
+            a1 = self.expr()
+            a2 = None
+            if tok.up == 'MID$' and self.accept_op(','):
+                a2 = self.expr()
+            self.expect_op(')')
+            if src[0] == 'lit' and a1.k == 'const' and (a2 is None or a2.k == 'const'):
+                text = src[1]                   # all known: work it out now
+                if tok.up == 'LEFT$':
+                    return ('lit', text[:max(0, a1.a)])
+                if tok.up == 'RIGHT$':
+                    return ('lit', text[len(text) - min(len(text), max(0, a1.a)):])
+                if a1.a < 1:
+                    return ('lit', '')
+                return ('lit', text[a1.a - 1:] if a2 is None else text[a1.a - 1:a1.a - 1 + max(0, a2.a)])
+            if tok.up == 'MID$':
+                return ('mid', src, a1, a2)
+            return ('left' if tok.up == 'LEFT$' else 'right', src, a1)
+        if tok.kind == 'id' and tok.up in ('CHR$', 'DEC$', 'HEX$'):
+            self.expect_op('(')
+            n = self.expr()
+            self.expect_op(')')
+            if n.k == 'const':
+                if tok.up == 'CHR$':
+                    if not 0 <= n.a <= 255:
+                        raise RBError('CHR$(%d): character code out of range 0-255' % n.a)
+                    return ('lit', chr(n.a))
+                if tok.up == 'DEC$':
+                    return ('lit', str(n.a if n.a < 0 else n.a & 0xFFFFFFFF))
+                return ('lit', '%08X' % (n.a & 0xFFFFFFFF))
+            return ({'CHR$': 'chr', 'DEC$': 'dec', 'HEX$': 'hex'}[tok.up], n)
+        if tok.kind == 'id':
+            f = self.funcs.get(tok.up)
+            if f is not None:
+                if not f['str']:
+                    raise RBError('%s does not return a STRING' % tok.up)
+                return ('call', tok.up, self.call_args(tok.up, True))
+            o = self.lookup_var(tok.up)
+            if o is not None and o.strref:
+                return ('ptr', o.reg)
+            if o is not None and o.kind == 'array' and not self.isop('('):
+                if o.width != 8 or o.isbit:
+                    raise RBError("'%s' is not a STRING or BYTE array" % tok.val)
+                return ('arr', o)
+        raise RBError("text expected (\"...\", a STRING, a string FUNCTION, CHR$, DEC$ or HEX$), found '%s'" % tok)
+
+    def str_expr(self):
+        """A string expression: terms joined with '+'. Adjacent text is merged."""
+        terms = [self.str_term()]
+        while self.accept_op('+'):
+            terms.append(self.str_term())
+        out = []
+        for t in terms:
+            if t[0] == 'lit' and out and out[-1][0] == 'lit':
+                out[-1] = ('lit', out[-1][1] + t[1])
+            else:
+                out.append(t)
+        return out
+
+    def str_address(self, term):
+        """Address of a string argument in T1 (or its register): text, buffer, string FUNCTION or parameter."""
+        em = self.em
+        kind = term[0]
+        if kind == 'lit':
+            if '\0' in term[1]:
+                raise RBError('a string argument cannot contain CHR$(0)')
+            lab = self.strings.setdefault(term[1], '__str%d' % len(self.strings))
+            em.la(T1, lab)
+            return T1
+        if kind == 'arr':
+            em.li(T1, term[1].addr)
+            return T1
+        if kind == 'call':
+            self.gen_call(term[1], term[2], False)
+            em.li(T1, self.str_buf(self.funcs[term[1]]).addr)
+            return T1
+        if kind == 'ptr':
+            return term[1]
+        if kind in ('left', 'right', 'mid'):       # copy the substring into a scratch buffer
+            self.ensure_builder()
+            size = self.sub_size(term)
+            tmp = self.scratch_for(size)
+            em.la(T1, tmp)
+            em.li(T2, size)
+            self.need('__sbegin')
+            em.ins('jal', RA, '__sbegin')
+            self.building += 1
+            self.emit_sub_call(term, '__sapp_mid')
+            self.building -= 1
+            em.la(T1, tmp)
+            return T1
+        raise RBError('a STRING argument must be text, a STRING, a string FUNCTION, a STRING parameter '
+                      'or LEFT$ / RIGHT$ / MID$ (no CHR$, DEC$, HEX$ or +)')
+
+    def ensure_builder(self):
+        if self.sb_addr is None:
+            self.sb_addr = self.alloc_ram(8, 4)
+            self.ram_syms.append(('__sbstate', self.sb_addr, 8))
+
+    def scratch_for(self, size):
+        """Scratch buffer of the current owner (main program or FUNCTION), at least size bytes."""
+        sym = '__tmp_' + self.cur_func['name'] if self.cur_func else '__strtmp'
+        self.scratch[sym] = max(self.scratch.get(sym, 0), size)
+        return sym
+
+    def sub_size(self, t):
+        """Buffer size needed to hold a LEFT$ / RIGHT$ / MID$ result."""
+        src = t[1]
+        if src[0] == 'lit':
+            return len(src[1]) + 1
+        if src[0] in ('arr', 'call'):
+            return self.str_limit(src)
+        raise RBError('LEFT$ / RIGHT$ / MID$ of a STRING parameter can be used in PRINT and assignments; '
+                      'assign it to a STRING first to compare it or pass it on')
+
+    def emit_sub_call(self, t, routine):
+        """LEFT$ / RIGHT$ / MID$: offset, count and mode on the stack, source in T1 / T2, call routine."""
+        em = self.em
+        kind, src = t[0], t[1]
+        em.ins('addi', SP, SP, -12)
+        if kind == 'mid':
+            start = t[2]
+            if start.k == 'const':
+                em.li(T1, start.a - 1)
+            else:
+                self.gen(start, T1, True)
+                em.ins('addi', T1, T1, -1)        # MID$ counts from 1
+            em.ins('sw', T1, 0, SP)
+            count = t[3]
+        else:
+            em.ins('sw', ZERO, 0, SP)
+            count = t[2]
+        if count is None:
+            em.li(T1, 0xFFFFFFFF)
+        else:
+            self.gen(count, T1, True)
+        em.ins('sw', T1, 4, SP)
+        if kind == 'right':
+            em.li(T1, 1)
+            em.ins('sw', T1, 8, SP)
+        else:
+            em.ins('sw', ZERO, 8, SP)
+        em.mv(T1, self.str_address(src))
+        em.li(T2, self.str_limit(src))
+        self.need(routine)
+        em.ins('jal', RA, routine)
+        em.ins('addi', SP, SP, 12)
+
+    def gen_instr(self, a, dst):
+        """INSTR: 1-based position of the needle in the haystack, 0 if not found."""
+        em = self.em
+        start, hay, needle = a
+        if hay[0] in ('left', 'right', 'mid') and needle[0] in ('left', 'right', 'mid'):
+            raise RBError('INSTR: only one of the two strings can be LEFT$ / RIGHT$ / MID$; assign one first')
+        em.ins('addi', SP, SP, -12)
+        if start is None:
+            em.ins('sw', ZERO, 8, SP)
+        else:
+            if start.k == 'const':
+                em.li(T1, start.a - 1)
+            else:
+                self.gen(start, T1, True)
+                em.ins('addi', T1, T1, -1)        # positions count from 1
+            em.ins('sw', T1, 8, SP)
+        self.push(self.str_address(hay))
+        em.mv(T2, self.str_address(needle))
+        self.pop(T1)
+        em.li(T0, self.str_limit(hay))
+        em.ins('sw', T0, 0, SP)
+        em.li(T0, self.str_limit(needle))
+        em.ins('sw', T0, 4, SP)
+        self.need('__instr')
+        em.ins('jal', RA, '__instr')
+        em.ins('addi', SP, SP, 12)
+        em.mv(dst, T1)
+        return dst
+
+    def fixed_len(self, t):
+        if t[0] == 'lit':
+            return len(t[1])
+        if t[0] == 'chr':
+            return 1
+        return min(8, max(1, (t[1].width + 3) // 4))      # HEX$: fixed number of digits
+
+    def str_limit(self, t):
+        """Most characters a string term can hold (0xFFFFFFFF: until the 0)."""
+        if t[0] == 'arr':
+            return t[1].count
+        if t[0] == 'call':
+            return self.str_buf(self.funcs[t[1]]).count
+        if t[0] in ('left', 'right', 'mid'):
+            return self.sub_size(t)
+        return 0xFFFFFFFF
+
+    def gen_strlen(self, terms, dst):
+        """LEN: the lengths of the terms added up; text of fixed length is counted at compile time."""
+        em = self.em
+        fixed = 0
+        first = True
+        for t in terms:
+            if t[0] == 'dec':
+                raise RBError('LEN(DEC$(...)) is not supported: the number of digits is known only at run time')
+            if t[0] in ('lit', 'chr', 'hex'):
+                fixed += self.fixed_len(t)
+                continue
+            if not first:
+                self.push(T1)
+            if t[0] in ('left', 'right', 'mid'):
+                self.emit_sub_call(t, '__lenmid')
+            else:
+                em.mv(T1, self.str_address(t))
+                em.li(T2, self.str_limit(t))
+                self.need('__strlen')
+                em.ins('jal', RA, '__strlen')
+            if not first:
+                self.pop(T2)
+                em.ins('add', T1, T1, T2)
+            first = False
+        if fixed:
+            if fits12(fixed):
+                em.ins('addi', dst, T1, fixed)
+            else:
+                em.li(T2, fixed)
+                em.ins('add', dst, T1, T2)
+        else:
+            em.mv(dst, T1)
+        return dst
+
+    def gen_strcmp(self, a, dst):
+        """String comparison: byte by byte, unsigned; a shorter prefix is less."""
+        em = self.em
+        op, L, R = a
+        for side in (L, R):
+            if len(side) != 1:
+                raise RBError('compare single strings; assign a joined (+) string to a buffer first')
+            if side[0][0] in ('chr', 'dec', 'hex'):
+                raise RBError('compare text, a STRING, a string FUNCTION or a STRING parameter; '
+                              'build CHR$ / DEC$ / HEX$ into a STRING first')
+        l, r = L[0], R[0]
+        if l[0] in ('left', 'right', 'mid') and r[0] in ('left', 'right', 'mid'):
+            raise RBError('only one side of a comparison can be LEFT$ / RIGHT$ / MID$; assign one first')
+        if l[0] == 'call' and r[0] == 'call' and l[1] == r[1]:
+            raise RBError('both sides call %s, which has one result buffer; store one result first' % l[1])
+        self.push(self.str_address(l))
+        em.mv(T2, self.str_address(r))
+        self.pop(T1)
+        em.ins('addi', SP, SP, -8)             # limits for __strcmp on the stack
+        em.li(T0, self.str_limit(l))
+        em.ins('sw', T0, 0, SP)
+        em.li(T0, self.str_limit(r))
+        em.ins('sw', T0, 4, SP)
+        self.need('__strcmp')
+        em.ins('jal', RA, '__strcmp')
+        em.ins('addi', SP, SP, 8)
+        if op == '=':                          # T1 = -1, 0 or 1
+            em.ins('sltiu', dst, T1, 1)
+        elif op == '<>':
+            em.ins('sltu', dst, ZERO, T1)
+        elif op == '<':
+            em.ins('slti', dst, T1, 0)
+        elif op == '>=':
+            em.ins('slti', dst, T1, 0)
+            em.ins('xori', dst, dst, 1)
+        elif op == '>':
+            em.ins('slt', dst, ZERO, T1)
+        else:
+            em.ins('slti', dst, T1, 1)
+        return dst
+
+    def emit_build(self, dest, terms):
+        """dest = terms: build zero-terminated text in the buffer dest, cut at its size."""
+        em = self.em
+        self.ensure_builder()
+        cap = dest.count
+        fname = self.cur_func['name'] if self.cur_func else None
+        def reads_dest(t):
+            if t[0] in ('left', 'right', 'mid'):
+                t = t[1]                           # the substring's source
+            return t[0] == 'ptr' or (t[0] == 'arr' and t[1].addr == dest.addr) or \
+                (t[0] == 'call' and t[1] == fname)
+        overlap = any(reads_dest(t) for t in terms)
+        if overlap:                            # build in the scratch buffer, then copy
+            tmp = self.scratch_for(cap)
+            em.la(T1, tmp)
+        else:
+            em.li(T1, dest.addr)
+        em.li(T2, cap)
+        self.need('__sbegin')
+        em.ins('jal', RA, '__sbegin')
+        self.building += 1
+        for t in terms:
+            kind = t[0]
+            if kind == 'lit':
+                if len(t[1]) == 1:
+                    em.li(T1, ord(t[1]))
+                    self.need('__sapp_chr')
+                    em.ins('jal', RA, '__sapp_chr')
+                    continue
+                if '\0' in t[1]:
+                    raise RBError('text with CHR$(0) cannot be assigned')
+                lab = self.strings.setdefault(t[1], '__str%d' % len(self.strings))
+                em.la(T1, lab)
+                em.li(T2, -1)
+            elif kind == 'arr':
+                em.li(T1, t[1].addr)
+                em.li(T2, t[1].count)
+            elif kind == 'call':
+                self.gen_call(t[1], t[2], False)
+                buf = self.str_buf(self.funcs[t[1]])
+                em.li(T1, buf.addr)
+                em.li(T2, buf.count)
+            elif kind == 'ptr':
+                em.mv(T1, t[1])
+                em.li(T2, -1)
+            elif kind == 'chr':
+                self.gen(t[1], T1, True)
+                self.need('__sapp_chr')
+                em.ins('jal', RA, '__sapp_chr')
+                continue
+            elif kind in ('left', 'right', 'mid'):
+                self.emit_sub_call(t, '__sapp_mid')
+                continue
+            elif kind == 'dec':
+                self.gen(t[1], T1, True)
+                em.li(T2, 1 if t[1].signed else 0)
+                self.need('__sapp_dec')
+                em.ins('jal', RA, '__sapp_dec')
+                continue
+            else:
+                self.gen(t[1], T1, True)
+                em.li(T2, min(8, max(1, (t[1].width + 3) // 4)))
+                self.need('__sapp_hex')
+                em.ins('jal', RA, '__sapp_hex')
+                continue
+            self.need('__sapp_str')
+            em.ins('jal', RA, '__sapp_str')
+        self.building -= 1
+        if overlap:
+            em.li(T1, dest.addr)
+            em.li(T2, cap)
+            em.ins('jal', RA, '__sbegin')
+            em.la(T1, tmp)
+            em.li(T2, cap)
+            self.need('__sapp_str')
+            em.ins('jal', RA, '__sapp_str')
+
+    def print_terms(self, dn, terms, run):
+        """PRINT a string expression: each term in turn, no buffer needed. Returns the pending run."""
+        em = self.em
+        for t in terms:
+            kind = t[0]
+            if kind == 'lit':
+                run += [ord(ch) for ch in t[1]]
+                continue
+            self.print_chars(dn, run)
+            run = []
+            if kind in ('arr', 'call'):
+                if kind == 'call':
+                    self.gen_call(t[1], t[2], False)
+                    buf = self.str_buf(self.funcs[t[1]])
+                else:
+                    buf = t[1]
+                em.li(T1, buf.addr)
+                em.li(T2, buf.count)
+                self.need('__putbuf_' + dn)
+                em.ins('jal', RA, '__putbuf_' + dn)
+            elif kind == 'ptr':
+                em.mv(T1, t[1])
+                self.need('__puts_' + dn)
+                em.ins('jal', RA, '__puts_' + dn)
+            elif kind in ('left', 'right', 'mid'):
+                self.emit_sub_call(t, '__putmid_' + dn)
+            elif kind == 'chr':
+                self.gen(t[1], T1, True)
+                if self.devices[dn]['regs']['DATA'].width > 8:
+                    em.ins('andi', T1, T1, 255)
+                em.ins('jal', RA, '__putc_' + dn)
+            elif kind == 'dec':
+                self.gen(t[1], T1, True)
+                em.li(T2, 1 if t[1].signed else 0)
+                self.need('__putdec_' + dn)
+                em.ins('jal', RA, '__putdec_' + dn)
+            else:
+                self.gen(t[1], T1, True)
+                em.li(T2, min(8, max(1, (t[1].width + 3) // 4)))
+                self.need('__puthex_' + dn)
+                em.ins('jal', RA, '__puthex_' + dn)
+        return run
 
     def check_print_device(self, dn):
         dev = self.devices.get(dn)
@@ -3279,12 +4348,8 @@ class Compiler:
                 break
             items += 1
             tok = self.peek()
-            if tok.kind == 'str':
-                self.i += 1
-                bad = [ch for ch in tok.val if ord(ch) > 255]
-                if bad:
-                    raise RBError("PRINT: character '%s' is not in the 8-bit character set" % bad[0])
-                run += [ord(ch) for ch in tok.val]
+            if tok.kind == 'str' or (tok.kind == 'id' and self.is_str_start()):
+                run = self.print_terms(dn, self.str_expr(), run)
             elif self.accept_kw('HEX'):
                 self.print_chars(dn, run)
                 run = []
@@ -3315,19 +4380,6 @@ class Compiler:
                 em.li(T2, 1 if n.signed else 0)
                 self.need('__putdec_' + dn)
                 em.ins('jal', RA, '__putdec_' + dn)
-            elif tok.kind == 'id' and not self.isop_at(1, '(') and \
-                    getattr(self.lookup_var(tok.up), 'kind', None) == 'array':
-                self.i += 1
-                buf = self.lookup_var(tok.up)
-                if buf.width != 8 or buf.isbit:
-                    raise RBError("PRINT of an array needs a BYTE array (zero-terminated text), "
-                                  "'%s' is not one" % tok.val)
-                self.print_chars(dn, run)
-                run = []
-                em.li(T1, buf.addr)
-                em.li(T2, buf.count)
-                self.need('__putbuf_' + dn)
-                em.ins('jal', RA, '__putbuf_' + dn)
             else:
                 n = self.expr()
                 if n.k != 'const':
@@ -3372,6 +4424,25 @@ class Compiler:
     def runtime_text(self, name):
         if name in ('__mul', '__divu', '__div'):
             return {'__mul': rt_mul, '__divu': rt_divu, '__div': rt_div}[name]()
+        if name == '__sbegin':
+            return rt_sbegin(self.sb_addr)
+        if name == '__sapp_chr':
+            return rt_sapp_chr(self.sb_addr)
+        if name in ('__strlen', '__strcmp'):
+            return (rt_strlen if name == '__strlen' else rt_strcmp)()
+        if name == '__sapp_mid':
+            return rt_mid(name, 'jal ra, __sapp_str'), ['__strlen', '__sapp_str']
+        if name == '__lenmid':
+            return rt_mid(name, '', True), ['__strlen']
+        if name == '__instr':
+            return rt_instr()
+        if name == '__val':
+            return rt_val()
+        if name.startswith('__putmid_'):
+            dn = name[len('__putmid_'):]
+            return rt_mid(name, 'jal ra, __putbuf_' + dn), ['__strlen', '__putbuf_' + dn]
+        if name in ('__sapp_str', '__sapp_dec', '__sapp_hex'):
+            return {'__sapp_str': rt_sapp_str, '__sapp_dec': rt_sapp_dec, '__sapp_hex': rt_sapp_hex}[name]()
         kind, dn = name[2:].split('_', 1)
         dev = self.devices[dn]
         if kind == 'getc':
@@ -3451,12 +4522,17 @@ class Compiler:
         if self.uses_ra and (self.rt_needed or self.funcs or self.irq):
             self.warn('RA (R1) is used as a variable, but SUB/FUNCTION calls and runtime calls '
                       '(PRINT, software * / MOD) overwrite it')
+        symbols = {}
+        for sym, size in self.scratch.items():
+            symbols[sym] = self.alloc_ram(size, 4)
+            self.ram_syms.append((sym, symbols[sym], size))
         ram_end = (self.ram_next + 3) & ~3
+        symbols['__ram_end'] = ram_end
         self.ram_used = ram_end - self.ram_base
         if self.ram_used + self.stack > self.ram_size:
             raise RBError('RAM overflow: %d bytes of variables + %d bytes of stack > %d bytes of RAM'
                           % (self.ram_used, self.stack, self.ram_size))
-        em.finalize({'__ram_end': ram_end})
+        em.finalize(symbols)
         self.code_used = em.nbytes
         if self.code_used > self.code_size:
             raise RBError('code overflow: %d bytes > CODE SIZE %d bytes' % (self.code_used, self.code_size))
@@ -3558,7 +4634,7 @@ class Compiler:
                 syms.append((label, addr, sizes[label], 'func', 'text'))
             elif label == 'main':
                 syms.append(('main', addr, em.addr_at(self.em.labels['__end']) - addr, 'func', 'text'))
-            elif label.startswith('__str') or label == '__pow10':
+            elif re.fullmatch(r'__str\d+', label) or label == '__pow10':     # string constants, table
                 syms.append((label, addr, 0, 'object', 'text'))
             else:
                 syms.append((label, addr, 0, 'notype', 'text'))

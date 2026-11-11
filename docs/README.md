@@ -4,7 +4,7 @@ A BASIC-like language for RISC-V, compiled directly to machine code: single pass
 
 Language design: Antti Lukats (Identor #1). Compiler: Claude (Identor #9). 10 November 2026 (7 AG).
 
-- `RiscBasic-Spec.md`: the language specification (Draft 0.12)
+- `RiscBasic-Spec.md`: the language specification (Draft 0.22)
 - `riscbasic.py`: the compiler (Python 3, no dependencies)
 - `rbsim.py`: a small RV32I/M/C/Zbb simulator used for testing
 - `mem2elf.py`: converts a `.mem` file into an ELF executable
@@ -95,12 +95,12 @@ Steps over all test programs (RV32IC): branch shrinking saved 3.3%, runtime call
 
 ## Status and differences from the spec
 
-Implemented: everything in Draft 0.12 sections 2–11, including active-low `NOT` bits and fields (3.2.1), except for the points below.
+Implemented: everything in Draft 0.22 sections 2–11, including active-low `NOT` bits and fields (3.2.1), except for the points below.
 
 1. **Compressed instructions**: see above.
 2. **Recursion.** Parameters and `DIM` inside a SUB are not saved across a recursive call (locals are static RAM). Recursion works only if the SUB does not need its parameters after the recursive call.
 3. **Stack checking** is limited to: RAM variables + `STACK` must fit in `RAM SIZE`. Call depth is not analysed.
-4. **`CASE`** takes constants only (`CASE 1, 2, 5`); there are no ranges.
+4. **`CASE`** takes constants, ranges and `IS` comparisons (`CASE 1, 5 TO 9, IS > 100`). The values must be constants.
 5. **IRQ names.** `ON IRQ` takes a number or `MSOFT` (3), `MTIMER` (7), `MEXT` (11). The spec's `ON IRQ TIMER0` needs `CONST TIMER0 = 7`. Interrupts are enabled with inline ASM (`csrsi mstatus, 8`).
 6. **`FOR`** compares the counter signed, so `FOR S2 = 10 TO 0 STEP -1` stops correctly.
 7. **`DELAY_US` / `DELAY_MS`** assume 2 instructions per loop pass times `CPI`. Calibrate `CPI` on real hardware.
@@ -109,9 +109,10 @@ Implemented: everything in Draft 0.12 sections 2–11, including active-low `NOT
 ## Internals
 
 - Compiler temporaries: `s0` and `s1` carry values, `a5` holds device base addresses (v0.5). All three are in x8–x15, so `c.lw`, `c.sw`, `c.andi`, `c.beqz` and the other 3-bit-register RVC forms apply to compiler code. `t0`–`t2` are free for user variables.
-- Runtime routines (`__mul`, `__divu`, `__div`, and per-device `__putc_`, `__puts_`, `__putbuf_`, `__puthex_`, `__getc_`, `__getdec_`, `__gethex_`, `__getline_`, `__putdec_`) are emitted once, after the program, only if used. They are called with `jal ra` (2 bytes as `c.jal`) and return with `ret`. They take arguments in `s0`/`s1`, save every other register they use, and save `RA` when they call another routine.
+- Runtime routines (`__mul`, `__divu`, `__div`, and per-device `__putc_`, `__puts_`, `__putbuf_`, `__puthex_`, `__getc_`, `__getdec_`, `__gethex_`, `__getline_`, and for strings `__sbegin`, `__sapp_chr`, `__sapp_str`, `__sapp_dec`, `__sapp_hex`, `__strlen`, `__strcmp`, `__sapp_mid`, `__lenmid`, `__putmid_`, `__instr`, `__val`, `__putdec_`) are emitted once, after the program, only if used. They are called with `jal ra` (2 bytes as `c.jal`) and return with `ret`. They take arguments in `s0`/`s1`, save every other register they use, and save `RA` when they call another routine.
 - `RA` is therefore not a safe place for a value: SUB and FUNCTION calls, PRINT and software multiply/divide overwrite it. SUBs and IRQ handlers save `RA` on entry. The compiler warns if a program uses `RA` (`R1`) directly and also makes calls.
 - Register variables are global: a SUB may change them, and only `RA` is saved by the callee (spec section 7). A global register variable in an argument register is saved by the caller around calls that use that register.
+- Strings are built with a small state block in RAM (`__sbstate`: current position and end). When a string `FUNCTION` is called while another string is being built, the caller saves and restores that state around the call. Overlapping assignments build in a scratch buffer: `__strtmp` for the main program and `__tmp_NAME` for each string FUNCTION, each sized to the largest target it needs.
 - RAM variables are addressed relative to `GP = RAM base + 2048`, so the first 4 KB of RAM are one instruction away.
 - `DEC` uses a power-of-ten table, so it needs no multiply or divide.
 - Interrupts: one dispatcher at `mtvec` saves the caller-saved registers, reads `mcause` and calls the matching `ON IRQ` block.

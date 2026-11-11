@@ -39,6 +39,15 @@ DEVICE UART1 AT &H4000_1100
   BIT RXREADY = NOT STATUS.1
 END DEVICE
 
+DEVICE WO AT &H4000_3000
+  REG OUT AT +0 WRITEONLY
+  REG SET AT +4 SETS OUT
+  REG CLR AT +8 CLEARS OUT
+  BIT LED = OUT.2
+  BIT LEDN = NOT OUT.9
+  FIELD F = OUT[7:4]
+END DEVICE
+
 DEVICE PLAIN AT &H4000_2000
   REG CTRL AT +0
   REG WIDE AT +4
@@ -171,6 +180,369 @@ PRINT UART1, name, raw, 13, 10
 ''', 'Name? Bob\r\nHello, Bob!\r\nABCD|\r\n[]\r\nABCD\r\n',
      check=lambda s: ''.join(s.uart_out.get(0x40001100, [])) == 'ABCD\r\n')
 RX['print buffers'] = {0: 'Bob\r'}
+
+test('writeonly with shadow', '''
+CONSOLE UART0
+WO.OUT = &H100
+WO.LED = 1
+WO.F = 9
+PRINT HEX WO.OUT, " ", DEC WO.LED, " ", DEC WO.F, " ", DEC WO.LEDN, 13, 10
+WO.LEDN = 0
+IF WO.LEDN THEN PRINT "on", 13, 10 ELSE PRINT "off", 13, 10
+WO.SET = &H1000
+WO.CLR = &H4
+PRINT HEX WO.OUT, 13, 10
+R10 = 3
+WO.F = R10
+ATOMIC WO.LED = 1
+WAIT UNTIL WO.LED
+PRINT HEX WO.OUT, 13, 10
+INPUT HEX WO.OUT
+PRINT " ", HEX WO.OUT, 13, 10
+''', '00000194 1 9 1\r\noff\r\n00001390\r\n00001334\r\n7e ' '0000007E\r\n',
+     check=lambda s: s.wout_log == [0x100, 0x104, 0x194, 0x394, 0x1394, 0x1390, 0x1330, 0x1334, 0x7E])
+RX['writeonly with shadow'] = {0: '7e\r'}
+
+test('repeat until', '''
+CONSOLE UART0
+DIM i AS WORD
+DIM n AS WORD
+i = 0
+REPEAT
+  i = i + 1
+  PRINT DEC i
+UNTIL i >= 5
+PRINT 13, 10
+i = 100
+REPEAT
+  PRINT "once"
+UNTIL 1
+PRINT 13, 10
+n = 0
+REPEAT
+  i = 0
+  REPEAT
+    i = i + 1
+    IF i = 3 THEN EXIT REPEAT
+  UNTIL 0
+  n = n + i
+  DO
+    n = n + 1
+  LOOP UNTIL n MOD 2 = 0
+UNTIL n > 10
+PRINT DEC n, 13, 10
+REPEAT
+UNTIL UART0.TXREADY
+PRINT "ok", 13, 10
+''', '12345\r\nonce\r\n12\r\nok\r\n')
+
+test('case ranges', '''
+CONSOLE UART0
+DIM i AS SWORD
+DIM c AS BYTE
+DIM w AS WORD
+FOR i = -3 TO 12
+  SELECT CASE i
+  CASE -3 TO -1
+    PRINT "n"
+  CASE 0
+    PRINT "z"
+  CASE 1 TO 3, 7
+    PRINT "a"
+  CASE 4 TO 6
+    PRINT "b"
+  CASE 8, 10 TO 11
+    PRINT "c"
+  CASE ELSE
+    PRINT "?"
+  END SELECT
+NEXT
+PRINT 13, 10
+c = "q"
+SELECT CASE c
+CASE "0" TO "9"
+  PRINT "digit"
+CASE "a" TO "z", "A" TO "Z"
+  PRINT "letter"
+END SELECT
+w = &H90000000
+SELECT CASE w
+CASE 0 TO &H7FFFFFFF
+  PRINT " low"
+CASE &H80000000 TO &HFFFFFFFF
+  PRINT " high"
+END SELECT
+SELECT CASE w
+CASE 5000 TO 100000
+  PRINT " mid"
+CASE ELSE
+  PRINT " other"
+END SELECT
+PRINT 13, 10
+''', 'nnnzaaabbbac?cc?\r\nletter high other\r\n')
+
+test('case is', '''
+CONSOLE UART0
+DIM i AS SWORD
+DIM w AS WORD
+FOR i = -2 TO 6
+  SELECT CASE i
+  CASE IS < 0
+    PRINT "n"
+  CASE 0, IS = 2
+    PRINT "z"
+  CASE IS <= 3, 5
+    PRINT "s"
+  CASE IS >= 6
+    PRINT "L"
+  CASE IS <> 99
+    PRINT "x"
+  END SELECT
+NEXT
+w = &HFFFFFFF0
+SELECT CASE w
+CASE IS < 100
+  PRINT " small"
+CASE IS > 100
+  PRINT " big"
+END SELECT
+i = -16
+SELECT CASE i
+CASE IS < 100
+  PRINT " neg"
+CASE ELSE
+  PRINT " ?"
+END SELECT
+SELECT CASE w
+CASE IS < 0, 1 TO 9, IS > &HFFFFFF00
+  PRINT " mixed"
+END SELECT
+PRINT 13, 10
+''', 'nnzszsxsL big neg mixed\r\n')
+
+test('single-line if else', '''
+CONSOLE UART0
+DIM a AS WORD
+DIM b AS WORD
+FOR a = 0 TO 1
+  IF a THEN PRINT "T" ELSE PRINT "F"
+  IF a = 1 THEN R12 = 5 ELSE R12 = 7
+  PRINT DEC R12
+NEXT
+PRINT 13, 10
+FOR a = 0 TO 1
+  FOR b = 0 TO 1
+    IF a THEN IF b THEN PRINT "11 " ELSE PRINT "10 "
+  NEXT
+NEXT
+PRINT 13, 10
+FOR a = 0 TO 1
+  FOR b = 0 TO 1
+    IF a THEN IF b THEN PRINT "11 " ELSE PRINT "10 " ELSE PRINT "0x "
+  NEXT
+NEXT
+PRINT 13, 10
+IF 0 THEN PRINT "no" ELSE IF 1 THEN PRINT "else-if" ELSE PRINT "no"
+PRINT 13, 10
+''', 'F7T5\r\n10 11 \r\n0x 0x 10 11 \r\nelse-if\r\n')
+
+test('colon separator', '''
+CONSOLE UART0
+DIM i AS WORD : DIM s AS WORD
+SUB Hi : PRINT "hi" : END SUB
+s = 0 : FOR i = 1 TO 4 : s = s + i : NEXT : PRINT DEC s, 13, 10
+R10 = 0 : R10[7:4] = 5 : PRINT HEX R10, 13, 10
+i = 0 : DO : i = i + 1 : LOOP UNTIL i = 3 : PRINT DEC i, 13, 10
+IF i = 3 THEN PRINT "a" : PRINT "b" ELSE PRINT "c" : PRINT "d"
+PRINT 13, 10
+IF i = 4 THEN PRINT "a" : PRINT "b" ELSE PRINT "c" : PRINT "d"
+PRINT 13, 10
+IF i = 3 THEN IF s = 10 THEN PRINT "x" : PRINT "y" ELSE PRINT "z"
+PRINT 13, 10
+IF i = 3 THEN IF s = 11 THEN PRINT "x" : PRINT "y" ELSE PRINT "z" : PRINT "w"
+PRINT 13, 10
+done: PRINT "label" : PRINT 13, 10
+SELECT CASE i : CASE 3 : PRINT "three" : CASE ELSE : PRINT "?" : END SELECT : PRINT 13, 10
+PRINT "rem" : REM a comment : PRINT "no"
+PRINT 13, 10
+Hi : Hi : PRINT 13, 10
+IF s = 10 THEN : PRINT "then-colon"
+PRINT 13, 10
+''', '10\r\n00000050\r\n3\r\nab\r\ncd\r\nxy\r\nzw\r\nlabel\r\nthree\r\nrem\r\nhihi\r\nthen-colon\r\n')
+
+test('strings', '''
+CONSOLE UART0
+CONST CR = 13
+CONST LF = 10
+DIM name AS STRING * 12
+DIM s AS STRING * 8
+DIM n AS SWORD
+FUNCTION Hex8(v AS WORD) AS STRING * 12
+  RETURN "0x" + HEX$(v)
+END FUNCTION
+FUNCTION Greet(who AS STRING) AS STRING * 16
+  RETURN "Hi " + who + "!"
+END FUNCTION
+FUNCTION Pad(v AS WORD) AS STRING * 6
+  IF v < 10 THEN RETURN "00" + DEC$(v)
+  IF v < 100 THEN RETURN "0" + DEC$(v)
+  RETURN DEC$(v)
+END FUNCTION
+FUNCTION Empty() AS STRING * 4
+END FUNCTION
+FUNCTION Twice(x AS WORD) AS WORD
+  RETURN x * 2
+END FUNCTION
+SUB Show(t AS STRING)
+  PRINT "[", t, "]", CR, LF
+END SUB
+FUNCTION Maybe(x AS WORD) AS STRING * 8
+  IF x THEN RETURN "yes"
+  EXIT FUNCTION
+END FUNCTION
+PRINT "[", Maybe(1), "|", Maybe(0), "]", CR, LF
+PRINT Hex8(255), CR, LF
+name = "Bob"
+PRINT Greet(name), CR, LF
+PRINT Greet("Ann") + "?", CR, LF
+s = "abcdefghijk"
+PRINT s, "|", CR, LF
+n = -42 : name = "n=" + DEC$(n) + CHR$(33)
+PRINT name, CR, LF
+name = "<" + name + ">"
+PRINT name, CR, LF
+name = Pad(7) + "/" + Pad(42) + "/" + Pad(123)
+PRINT name, CR, LF
+PRINT Greet(Hex8(16)), CR, LF
+PRINT Greet(Greet("X")), CR, LF
+PRINT "[", Empty(), "]", CR, LF
+name = "a" + Pad(5) + "b"
+PRINT name, CR, LF
+s = DEC$(Twice(21))
+PRINT s, CR, LF
+n = 65 : s = CHR$(n) + CHR$(n + 1)
+PRINT s, CR, LF
+Show "lit"
+Show name
+Show Hex8(1)
+LINE INPUT "Name? ", name
+PRINT CR, LF, Greet(name), CR, LF
+''', '[yes|]\r\n0x000000FF\r\nHi Bob!\r\nHi Ann!?\r\nabcdefg|\r\nn=-42!\r\n<n=-42!>\r\n007/042/123\r\n'
+     'Hi 0x00000010!\r\nHi Hi X!!\r\n[]\r\na005b\r\n42\r\nAB\r\n[lit]\r\n[a005b]\r\n[0x00000001]\r\n'
+     'Name? Zed\r\nHi Zed!\r\n')
+RX['strings'] = {0: 'Zed\r'}
+
+test('len and string comparison', '''
+CONSOLE UART0
+CONST CR = 13
+CONST LF = 10
+DIM a AS STRING * 10
+DIM b AS STRING * 10
+DIM c AS BYTE
+DIM r(4) AS BYTE
+FUNCTION Hex(v AS WORD) AS STRING * 10
+  RETURN HEX$(v)
+END FUNCTION
+FUNCTION L2(t AS STRING) AS WORD
+  RETURN LEN(t)
+END FUNCTION
+SUB Check(t AS STRING)
+  IF t = "yes" THEN PRINT "Y" ELSE PRINT "N"
+END SUB
+a = "apple" : b = "apricot"
+PRINT DEC LEN(a), " ", DEC LEN(b), " ", DEC LEN("xyz"), " ", DEC LEN(a + b + "!"), CR, LF
+PRINT DEC (a = "apple"), DEC (a <> "apple"), DEC (a < b), DEC (a > b), DEC (a <= a), DEC (b >= a), CR, LF
+IF a = "apple" THEN PRINT "eq" ELSE PRINT "ne"
+IF b < a THEN PRINT " lt" ELSE PRINT " ge"
+PRINT CR, LF
+a = ""
+PRINT DEC LEN(a), " ", DEC (a = ""), " ", DEC (a < "a"), CR, LF
+b = "ab" : a = "abc"
+PRINT DEC (b < a), DEC (a > b), DEC NOT (a = b), CR, LF
+IF Hex(10) = "0000000A" THEN PRINT "hex ok"
+c = 65
+IF c = "A" THEN PRINT " num ok"
+IF "A" = c THEN PRINT " rev ok"
+PRINT CR, LF
+r(0) = 65 : r(1) = 66 : r(2) = 67 : r(3) = 68
+PRINT DEC LEN(r), " ", DEC (r = "ABCD"), " ", DEC (r = "ABC"), " ", DEC (r < "ABCDE"), CR, LF
+a = CHR$(200) : b = "z"
+PRINT DEC (a > b), CR, LF
+Check "yes" : Check "no" : a = "yes" : Check a
+PRINT " ", DEC L2("four"), " ", DEC L2(Hex(1)), CR, LF
+b = "ab"
+a = DEC$(LEN(b)) + "!" + DEC$(LEN(b) + LEN("cd"))
+PRINT a, CR, LF
+WHILE LEN(a) < 8
+  a = a + "."
+WEND
+PRINT a, " ", DEC LEN(CHR$(c) + HEX$(c)), CR, LF
+''', '5 7 3 13\r\n101011\r\neq ge\r\n0 1 1\r\n111\r\nhex ok num ok rev ok\r\n4 1 0 1\r\n1\r\nYNY 4 8\r\n2!4\r\n2!4..... 3\r\n')
+
+test('left right mid instr', '''
+CONSOLE UART0
+CONST CR = 13 : CONST LF = 10
+DIM s AS STRING * 16
+DIM t AS STRING * 16
+DIM n AS WORD
+FUNCTION Word2(x AS STRING) AS STRING * 16
+  RETURN MID$(x, 7)
+END FUNCTION
+FUNCTION Tag(x AS STRING) AS STRING * 16
+  RETURN "<" + x + ">"
+END FUNCTION
+FUNCTION Twice(x AS STRING) AS STRING * 16
+  RETURN x + x
+END FUNCTION
+s = "Hello, World"
+PRINT LEFT$(s, 5), "|", RIGHT$(s, 5), "|", MID$(s, 8, 3), "|", MID$(s, 8), CR, LF
+n = 3
+t = LEFT$(s, n) + "-" + RIGHT$(s, n + 1) + "-" + MID$(s, n, n)
+PRINT t, CR, LF
+PRINT DEC LEN(MID$(s, 8, 3)), " ", DEC LEN(MID$(s, 20)), " ", DEC LEN(LEFT$(s, 100)), " ", DEC LEN(RIGHT$(s, 0)), CR, LF
+PRINT "[", MID$(s, 0), "][", MID$(s, 13), "][", RIGHT$(s, 50), "]", CR, LF
+IF LEFT$(s, 5) = "Hello" THEN PRINT "left ok"
+IF MID$(s, 8, 5) <> "World" THEN PRINT " bad" ELSE PRINT " mid ok"
+PRINT CR, LF
+PRINT DEC INSTR(s, "World"), " ", DEC INSTR(s, "o"), " ", DEC INSTR(6, s, "o"), " ", DEC INSTR(s, "xyz"), " "
+PRINT DEC INSTR(s, ""), " ", DEC INSTR(20, s, "o"), " ", DEC INSTR(n * 2, s, "o"), CR, LF
+PRINT DEC INSTR("abcabc", "ca"), " ", DEC INSTR(LEFT$(s, 4), "l"), " ", DEC INSTR(s, MID$(s, 8, 2)), CR, LF
+PRINT Word2(s), CR, LF
+t = "abc" : t = MID$(t, 2) + t
+PRINT t, CR, LF
+PRINT LEFT$("abcdef", 3), RIGHT$("abcdef", 2), MID$("abcdef", 2, 3), DEC LEN(MID$("abcdef", 5)), CR, LF
+PRINT Tag(LEFT$(s, 4)), Tag(MID$(Word2(s), 2)), CR, LF
+t = "bcabc" : t = "x" + t + Twice("ab")
+PRINT t, CR, LF
+''', 'Hello|World|Wor|World\r\nHel-orld-llo\r\n3 0 12 0\r\n[][][Hello, World]\r\nleft ok mid ok\r\n'
+     '8 5 9 0 1 0 9\r\n3 3 8\r\n World\r\nbcabc\r\nabcefbcd2\r\n<Hell><World>\r\nxbcabcabab\r\n')
+
+def val_signed(text):
+    from riscbasic import val_text
+    v = val_text(text)
+    return v - (1 << 32) if v >> 31 else v
+
+
+VAL_CASES = ['123', '  -42abc', '+7', '&HFF', '0x1f', '&b101', '0B11', 'abc', '', '&', '0', '09', '0x',
+             '2147483647', '4294967295', '-0', '  &hDeadBeef', '12 34', '-&H10', '7a']
+test('val', '''
+CONSOLE UART0
+DIM s AS STRING * 16
+DIM n AS SWORD
+FUNCTION Num(x AS STRING) AS SWORD
+  RETURN VAL(x) + 1
+END FUNCTION
+''' + ''.join('s = "%s" : PRINT DEC VAL(s), " ", DEC VAL("%s"), 13, 10\n' % (c, c) for c in VAL_CASES) + '''
+s = "ab12cd"
+PRINT DEC VAL(MID$(s, 3, 2)), " ", DEC VAL("55") + 1, " ", DEC Num("41"), 13, 10
+n = VAL("-5")
+IF n < 0 THEN PRINT "neg", 13, 10
+LINE INPUT "> ", s
+n = VAL(MID$(s, 3)) * 2
+PRINT 13, 10, DEC n, 13, 10
+''', ''.join('%d %d\r\n' % (val_signed(c), val_signed(c)) for c in VAL_CASES) +
+     '12 56 42\r\nneg\r\n> x=300\r\n600\r\n')
+RX['val'] = {0: 'x=300\r'}
 
 test('dec edge values', '''
 DIM s AS SWORD
@@ -577,7 +949,33 @@ ERRORS = [
     ('CONSOLE UART0' + chr(10) + 'DIM w(4) AS WORD' + chr(10) + 'LINE INPUT w', 'BYTE array'),
     ('CONSOLE UART0' + chr(10) + 'DIM b(4) AS BYTE' + chr(10) + 'LINE b', 'INPUT expected'),
     ('DIM line AS WORD', 'reserved'),
+    ('UNTIL 1', 'no matching REPEAT'),
+    ('SELECT CASE R10' + chr(10) + 'CASE 5 TO 1' + chr(10) + 'END SELECT', 'empty'),
+    ('SELECT CASE R10' + chr(10) + 'CASE IS 5' + chr(10) + 'END SELECT', 'comparison'),
+    ('SELECT CASE R10' + chr(10) + 'CASE IS < R11' + chr(10) + 'END SELECT', 'constant'),
+    ('DIM is AS WORD', 'reserved'),
+    ('IF 1 THEN : R10 = 1 : END IF', 'no matching IF'),
+    ('DIM t AS STRING * 8' + chr(10) + 'R10 = t', 'is a STRING'),
+    ('FUNCTION F() AS STRING' + chr(10) + 'END FUNCTION', 'needs a size'),
+    ('DIM t AS STRING * 8' + chr(10) + 't = 5', 'text expected'),
+    ('SUB S(t AS STRING)' + chr(10) + 't = "x"' + chr(10) + 'END SUB', 'read-only'),
+    ('FUNCTION G(t AS STRING) AS STRING * 8' + chr(10) + 'END FUNCTION' + chr(10) + 'CONSOLE UART0' + chr(10) + 'PRINT G(5)', 'text expected'),
+    ('FUNCTION H() AS STRING * 8' + chr(10) + 'END FUNCTION' + chr(10) + 'R10 = H()', 'returns a STRING'),
+    ('DIM t AS STRING * 1', 'room for at least one'),
+    ('DIM t AS STRING * 8' + chr(10) + 'IF t + "x" = "y" THEN R10 = 1', 'single strings'),
+    ('FUNCTION F(v AS WORD) AS STRING * 8' + chr(10) + 'END FUNCTION' + chr(10) + 'IF F(1) = F(2) THEN R10 = 1', 'one result buffer'),
+    ('R10 = LEN(DEC$(R11))', 'not supported'),
+    ('R10 = VAL(DEC$(R11))', 'VAL: build'),
+    ('DIM val AS WORD', 'reserved'),
+    ('DIM t AS STRING * 8' + chr(10) + 'IF LEFT$(t, 1) = RIGHT$(t, 1) THEN R10 = 1', 'only one side'),
+    ('DIM t AS STRING * 8' + chr(10) + 't = LEFT$(MID$(t, 2, 3), 1)', 'nested'),
+    ('SUB S(x AS STRING)' + chr(10) + 'IF LEFT$(x, 1) = "a" THEN R10 = 1' + chr(10) + 'END SUB', 'STRING parameter'),
+    ('DIM t AS STRING * 8' + chr(10) + 'IF t = DEC$(R11) THEN R10 = 1', 'build CHR$'),
+    ('SELECT CASE R10' + chr(10) + 'CASE R11 TO 3' + chr(10) + 'END SELECT', 'constant'),
+    ('REPEAT', 'REPEAT block not closed'),
+    ('DO' + chr(10) + 'UNTIL 1', 'no matching REPEAT'),
     ('DIM w(4) AS WORD' + chr(10) + 'PRINT UART0, w', 'BYTE array'),
+    ('DEVICE D AT 0' + chr(10) + 'REG R AT +0 READONLY WRITEONLY' + chr(10) + 'END DEVICE', 'both'),
     ('DIM CHR AS WORD', 'reserved'),
     ('CONSOLE GPIO', 'TXREADY'),
     ('CONSOLE NOPE', 'not a device'),
