@@ -1,0 +1,54 @@
+con' RiscBasic example (spec section 12)
+
+
+TARGET RV32IC
+CLOCK  100_000_000
+CODE   AT &H0000 SIZE 14336
+RAM    AT &H3800 SIZE 2048 
+
+CONST CR = 13
+CONST LF = 10
+
+'
+' AMD IO Module
+'
+DEVICE GPIO AT &H8000_0000
+  REG OUT  AT +16  WRITEONLY
+  REG IN   AT +32  READONLY
+END DEVICE
+
+DEVICE UART0 AT &H8000_0000
+  REG RXDATA AT +0 READONLY     ' RX FIFO
+  REG DATA   AT +4 : 8
+  REG STAT   AT +8 READONLY
+  BIT RXREADY = STAT.0          ' RX FIFO has data
+  BIT TXREADY = NOT STAT.3
+END DEVICE
+
+CONSOLE UART0
+
+ALIAS LED    = GPIO.OUT.0
+ALIAS BUTTON = GPIO.IN.0
+
+DIM presses AS WORD          ' RAM
+DIM ticks   AS WORD IN A0    ' register
+
+presses = 0
+ticks = 0
+PRINT UART0, "RiscBasic ready", 13, 10
+
+DO
+  'LED = BUTTON
+  'IF BUTTON THEN presses = presses + 1
+
+  LED = 1
+  DELAY_MS 500
+
+  LED = 0
+  DELAY_MS 500
+
+  ticks = ticks + 1
+  PRINT UART0, "presses ", DEC presses, " ticks ", HEX ticks, 13, 10
+
+
+LOOP
