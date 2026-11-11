@@ -1,0 +1,1 @@
+python ../source/riscbasic.py console_input.bas
