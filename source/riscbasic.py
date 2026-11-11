@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-RiscBasic compiler v0.13
+RiscBasic compiler v0.14
 (v0.2: compressed instructions for RV32IC / RV32EC; v0.3: branch shrinking and far branches;
- v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers)
+ v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers; v0.14: WRITEONLY registers with shadow)
 
-Compiles RiscBasic (spec: RiscBasic-Spec.md, Draft 0.12) directly to RISC-V
+Compiles RiscBasic (spec: RiscBasic-Spec.md, Draft 0.13) directly to RISC-V
 machine code in a single pass, without a linker.
 
     python riscbasic.py program.bas [-o outbase] [--no-lst]
@@ -22,7 +22,7 @@ import os
 import re
 import sys
 
-VERSION = '0.13'
+VERSION = '0.14'
 
 # ---------------------------------------------------------------- registers
 
@@ -864,7 +864,7 @@ KEYWORDS = DECLARATIONS | {
     'SUB', 'FUNCTION', 'RETURN', 'CALL', 'ON', 'IRQ', 'WAIT', 'DELAY_US',
     'DELAY_MS', 'PRINT', 'INPUT', 'LINE', 'HEX', 'DEC', 'CHR', 'SHL', 'SHR', 'SAR', 'ROL', 'ROR',
     'ATOMIC', 'ASM', 'LET', 'AND', 'OR', 'XOR', 'NOT', 'MOD', 'AS', 'IN',
-    'AT', 'SIZE', 'REG', 'BIT', 'FIELD', 'READONLY', 'SETS', 'CLEARS',
+    'AT', 'SIZE', 'REG', 'BIT', 'FIELD', 'READONLY', 'WRITEONLY', 'SETS', 'CLEARS',
     'MEM8', 'MEM16', 'MEM32'}
 
 
@@ -892,6 +892,10 @@ class Obj:
         self.lo = 0
         self.w = 1
         self.inv = False          # sub only: bit or field is inverted (NOT) on read and write
+        self.writeonly = False    # loc only: reads come from a RAM shadow copy
+        self.shadow = None        # loc only: the shadow RAM variable (created on first use)
+        self.sets = None          # loc only: register whose bits this register sets (SETS)
+        self.clears = None        # loc only: register whose bits this register clears (CLEARS)
         self.index = None
         self.count = 0
         self.__dict__.update(kw)
@@ -1825,6 +1829,8 @@ class Compiler:
             em.ins(self.ld(o.width, o.signed), dst, ofs, base)
             return dst
         if k == 'loc':
+            if o.writeonly:
+                return self.load_obj(self.shadow_of(o), dst, force)
             if o.addr is not None:
                 base, ofs = self.addr_base(o.addr)
                 em.ins(self.ld(o.width, o.signed), dst, ofs, base)
@@ -2135,10 +2141,54 @@ class Compiler:
             r = T2
         em.ins(self.st(o.width), r, ofs, base)
 
+    def shadow_of(self, o):
+        """RAM copy of a WRITEONLY register, allocated on first use (starts at 0)."""
+        if o.shadow is None:
+            if self.ram_base is None:
+                raise RBError('RAM must be declared before using WRITEONLY register %s' % o.name)
+            size = o.width // 8
+            o.shadow = Obj('ram', o.name + '.shadow', addr=self.alloc_ram(size, size), width=o.width)
+            self.ram_syms.append((o.name + '.shadow', o.shadow.addr, size))
+        return o.shadow
+
+    def store_value(self, o, n):
+        """Put the value of n into a register for storing: returns the register."""
+        if n.k == 'const':
+            v = self.fit_const(n.a, o.width, o.signed, o.name)
+            if v == 0:
+                return ZERO
+            self.em.li(T1, v)
+            return T1
+        return self.gen(n, T1)
+
     def assign_loc(self, o, n):
         em = self.em
         if o.readonly:
             raise RBError('%s is READONLY' % o.name)
+        if o.writeonly:
+            r = self.store_value(o, n)             # shadow first, then the register
+            sh = self.shadow_of(o)
+            b, ofs = self.addr_base(sh.addr)
+            em.ins(self.st(o.width), r, ofs, b)
+            b, ofs = self.addr_base(o.addr)
+            em.ins(self.st(o.width), r, ofs, b)
+            return
+        tgt = o.sets or o.clears
+        if o.addr is not None and tgt is not None and tgt.writeonly:
+            r = self.store_value(o, n)             # write SET/CLR, then update the target's shadow
+            b, ofs = self.addr_base(o.addr)
+            em.ins(self.st(o.width), r, ofs, b)
+            sh = self.shadow_of(tgt)
+            b, ofs = self.addr_base(sh.addr)
+            em.ins(self.ld(sh.width, False), T2, ofs, b)
+            if o.sets:
+                em.ins('or', T2, T2, r)
+            else:
+                em.ins('xori', T1, r, -1)
+                em.ins('and', T2, T2, T1)
+            b, ofs = self.addr_base(sh.addr)
+            em.ins(self.st(sh.width), T2, ofs, b)
+            return
         if o.addr is not None:
             self.assign_mem(o, n)
             return
@@ -2196,6 +2246,13 @@ class Compiler:
 
     def assign_sub(self, o, n):
         em = self.em
+        if o.base.kind == 'loc' and o.base.writeonly:
+            reg = o.base
+            sh = self.shadow_of(reg)               # change the bits in the shadow ...
+            r = self.assign_sub(Obj('sub', o.name, base=sh, lo=o.lo, w=o.w, width=o.w, inv=o.inv), n)
+            b, ofs = self.addr_base(reg.addr)      # ... then write the whole shadow to the register
+            em.ins(self.st(reg.width), r, ofs, b)
+            return
         base, lo, w = o.base, o.lo, o.w
         fmask = (1 << w) - 1
         mask = (fmask << lo) & 0xFFFFFFFF
@@ -2257,7 +2314,7 @@ class Compiler:
             if setbits:
                 self.or_imm(T1, T1, setbits, T2)
             em.ins(st, T1, ofs, b)
-            return
+            return T1
         if S is not None and C is not None:
             if w == 1:
                 if o.inv:                     # NOT bit: value 1 clears, value 0 sets
@@ -2296,6 +2353,7 @@ class Compiler:
                 b, ofs = self.addr_base(base.addr)
         em.ins('or', T2, T2, T1)
         em.ins(st, T2, ofs, b)
+        return T2
 
     # ---- calls
 
@@ -2574,6 +2632,8 @@ class Compiler:
                 k = self.expect_id().up
                 if k == 'READONLY':
                     o.readonly = True
+                elif k == 'WRITEONLY':
+                    o.writeonly = True
                 elif k in ('SETS', 'CLEARS'):
                     tn = self.expect_id().up
                     tgt = d['regs'].get(tn)
@@ -2581,10 +2641,14 @@ class Compiler:
                         raise RBError("%s: register '%s' must be declared first" % (k, tn))
                     if k == 'SETS':
                         tgt.setaddr = o.addr
+                        o.sets = tgt
                     else:
                         tgt.clraddr = o.addr
+                        o.clears = tgt
                 else:
                     raise RBError("unexpected '%s'" % k)
+            if o.readonly and o.writeonly:
+                raise RBError('%s cannot be both READONLY and WRITEONLY' % o.name)
             d['regs'][name] = o
         elif kw in ('BIT', 'FIELD'):
             name = self.expect_id().up
