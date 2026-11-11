@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-RiscBasic compiler v0.14
+RiscBasic compiler v0.16
 (v0.2: compressed instructions for RV32IC / RV32EC; v0.3: branch shrinking and far branches;
- v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers; v0.14: WRITEONLY registers with shadow)
+ v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers; v0.14: WRITEONLY registers with shadow; v0.15: REPEAT ... UNTIL; v0.16: CASE ranges)
 
-Compiles RiscBasic (spec: RiscBasic-Spec.md, Draft 0.13) directly to RISC-V
+Compiles RiscBasic (spec: RiscBasic-Spec.md, Draft 0.15) directly to RISC-V
 machine code in a single pass, without a linker.
 
     python riscbasic.py program.bas [-o outbase] [--no-lst]
@@ -22,7 +22,7 @@ import os
 import re
 import sys
 
-VERSION = '0.14'
+VERSION = '0.16'
 
 # ---------------------------------------------------------------- registers
 
@@ -859,7 +859,7 @@ CMP_OPS = ('=', '<>', '<', '>', '<=', '>=')
 DECLARATIONS = {'TARGET', 'CLOCK', 'CPI', 'CODE', 'RAM', 'STACK', 'CONST',
                 'DEVICE', 'ALIAS', 'DIM', 'CONSOLE'}
 KEYWORDS = DECLARATIONS | {
-    'IF', 'THEN', 'ELSEIF', 'ELSE', 'END', 'WHILE', 'WEND', 'DO', 'LOOP',
+    'IF', 'THEN', 'ELSEIF', 'ELSE', 'END', 'WHILE', 'WEND', 'DO', 'LOOP', 'REPEAT',
     'UNTIL', 'FOR', 'TO', 'STEP', 'NEXT', 'EXIT', 'GOTO', 'SELECT', 'CASE',
     'SUB', 'FUNCTION', 'RETURN', 'CALL', 'ON', 'IRQ', 'WAIT', 'DELAY_US',
     'DELAY_MS', 'PRINT', 'INPUT', 'LINE', 'HEX', 'DEC', 'CHR', 'SHL', 'SHR', 'SAR', 'ROL', 'ROR',
@@ -2885,6 +2885,18 @@ class Compiler:
             self.em.j(b['top'])
         self.em.label(b['exit'])
 
+    def st_repeat(self):
+        """REPEAT ... UNTIL cond: the body runs at least once, the test is at the end."""
+        top, ex = self.newlabel(), self.newlabel()
+        self.em.label(top)
+        self.blocks.append({'type': 'REPEAT', 'top': top, 'exit': ex})
+
+    def st_until(self):
+        b = self.top_block('REPEAT')
+        self.blocks.pop()
+        self.gen_branch(self.expr(), b['top'], False)
+        self.em.label(b['exit'])
+
     def st_for(self):
         vn = self.ref()
         o = vn.a if vn.k == 'obj' else None
@@ -2919,8 +2931,8 @@ class Compiler:
 
     def st_exit(self):
         kw = self.expect_id().up
-        if kw not in ('FOR', 'DO', 'WHILE', 'SUB', 'FUNCTION'):
-            raise RBError('EXIT FOR, DO, WHILE, SUB or FUNCTION expected')
+        if kw not in ('FOR', 'DO', 'WHILE', 'REPEAT', 'SUB', 'FUNCTION'):
+            raise RBError('EXIT FOR, DO, WHILE, REPEAT, SUB or FUNCTION expected')
         for b in reversed(self.blocks):
             if b['type'] == kw:
                 self.em.j(b['exit'])
@@ -2949,24 +2961,56 @@ class Compiler:
             b['next'] = None
             b['else'] = True
             return
-        vals = [self.const_expr()]
+        items = [self.case_item()]
         while self.accept_op(','):
-            vals.append(self.const_expr())
+            items.append(self.case_item())
         base, ofs = self.addr_base(b['slot'].addr)
         em.ins('lw', T1, ofs, base)
         body = self.newlabel()
         b['next'] = self.newlabel()
-        for j, v in enumerate(vals):
-            if v == 0:
-                r = ZERO
+        for j, (lo, hi) in enumerate(items):
+            last = j == len(items) - 1
+            if lo == hi:
+                if lo == 0:
+                    r = ZERO
+                else:
+                    em.li(T2, lo)
+                    r = T2
+                if last:
+                    em.ins('bne', T1, r, b['next'])
+                else:
+                    em.ins('beq', T1, r, body)
+                continue
+            # lo <= x <= hi  <=>  (x - lo) as unsigned <= hi - lo
+            span = hi - lo
+            if span >= 0xFFFFFFFF:                 # every 32-bit value matches
+                if not last:
+                    em.j(body)
+                continue
+            x = T1
+            if lo:
+                if fits12(-s32(lo)):
+                    em.ins('addi', T2, T1, -s32(lo))
+                else:
+                    em.li(T2, lo)
+                    em.ins('sub', T2, T1, T2)
+                x = T2
+            em.li(T0, span + 1)
+            if last:
+                em.ins('bgeu', x, T0, b['next'])
             else:
-                em.li(T2, v)
-                r = T2
-            if j < len(vals) - 1:
-                em.ins('beq', T1, r, body)
-            else:
-                em.ins('bne', T1, r, b['next'])
+                em.ins('bltu', x, T0, body)
         em.label(body)
+
+    def case_item(self):
+        """CASE value or CASE low TO high; returns (low, high)."""
+        lo = self.const_expr()
+        hi = lo
+        if self.accept_kw('TO'):
+            hi = self.const_expr()
+            if hi < lo:
+                raise RBError('CASE %d TO %d: the range is empty (low end first)' % (lo, hi))
+        return lo, hi
 
     def st_sub(self):
         self.begin_sub('SUB')

@@ -1,4 +1,4 @@
-con' RiscBasic example (spec section 12)
+' RiscBasic example (spec section 12)
 
 
 TARGET RV32IC
@@ -38,8 +38,13 @@ ticks = 0
 PRINT UART0, "RiscBasic ready", 13, 10
 
 DO
-  'LED = BUTTON
-  'IF BUTTON THEN presses = presses + 1
+  LED = NOT BUTTON
+  IF NOT BUTTON THEN 
+    REPEAT 
+      DELAY_MS 50  
+    UNTIL BUTTON 
+    presses = presses + 1
+  END IF
 
   LED = 1
   DELAY_MS 500
