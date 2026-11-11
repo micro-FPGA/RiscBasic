@@ -3,13 +3,12 @@
 ' Keys:  a = add two numbers,  l = set the LEDs (hex),  q = quit
 
 TARGET RV32IC
-CLOCK  25_000_000
-CODE   AT &H0000 SIZE 8K
-RAM    AT &H8000 SIZE 2K
+CLOCK  100_000_000
+CODE   AT &H0000 SIZE 14336
+RAM    AT &H3800 SIZE 2048 
 
 CONST CR = 13
 CONST LF = 10
-
 
 '
 ' AMD IOmodule support
