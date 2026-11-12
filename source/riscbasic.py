@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-RiscBasic compiler v0.27
+RiscBasic compiler v0.28
 (v0.2: compressed instructions for RV32IC / RV32EC; v0.3: branch shrinking and far branches;
- v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers; v0.14: WRITEONLY registers with shadow; v0.15: REPEAT ... UNTIL; v0.16: CASE ranges; v0.17: CASE IS; v0.18: single-line ELSE binds to the nearest IF; v0.19: ':' separator; v0.20: strings; v0.21: LEN and string comparison; v0.22: LEFT$ RIGHT$ MID$ INSTR; v0.23: VAL; v0.24: .include; v0.25: #IF conditional compilation; v0.26: MEM[addr]; v0.27: SUB BoardInit)
+ v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers; v0.14: WRITEONLY registers with shadow; v0.15: REPEAT ... UNTIL; v0.16: CASE ranges; v0.17: CASE IS; v0.18: single-line ELSE binds to the nearest IF; v0.19: ':' separator; v0.20: strings; v0.21: LEN and string comparison; v0.22: LEFT$ RIGHT$ MID$ INSTR; v0.23: VAL; v0.24: .include; v0.25: #IF conditional compilation; v0.26: MEM[addr]; v0.27: SUB BoardInit; v0.28: LUI reuse)
 
 Compiles RiscBasic (spec: RiscBasic-Spec.md, Draft 0.26) directly to RISC-V
 machine code in a single pass, without a linker.
@@ -22,7 +22,7 @@ import os
 import re
 import sys
 
-VERSION = '0.27'
+VERSION = '0.28'
 
 # ---------------------------------------------------------------- registers
 
@@ -344,6 +344,7 @@ class Emitter:
         self.lst = []
         self.labels = {}      # label -> index of the item that follows it
         self.line = 0
+        self.known = {}       # register -> LUI value it holds on every path to this point
 
     def pc(self):
         """Address of the next item during emission (final addresses come from finalize)."""
@@ -361,6 +362,7 @@ class Emitter:
             raise RBError("label '%s' defined twice" % name)
         self.labels[name] = len(self.code)
         self.lst.append(('label', name))
+        self.known.clear()                    # control can arrive here from elsewhere
 
     def comment(self, s):
         self.lst.append(('src', s))
@@ -373,7 +375,8 @@ class Emitter:
         ref = None
         if fix:
             kind, ref = {'B': 'branch', 'J': 'jump', 'HI': 'hi', 'LOI': 'loi', 'LOS': 'los'}[fix[0]], fix[1]
-        elif kind == 'fixed' and 'C' in self.ext:
+        self.track(word, kind)
+        if kind == 'fixed' and 'C' in self.ext:
             h = compress(word)
             if h is not None:
                 word, size, text = h, 2, rvc_text(rvc_name(h), text)
@@ -388,6 +391,22 @@ class Emitter:
         self.text.append(text)
         self.lst.append(('ins', idx))
         return idx
+
+    def track(self, word, kind):
+        """Keep self.known up to date for one 32-bit instruction (before compression)."""
+        op = word & 0x7F
+        if kind in ('data', 'align') or op in (0x6F, 0x67) or (op == 0x73 and (word >> 12) & 7 == 0):
+            self.known.clear()                # calls, returns, jumps, ecall/mret, data: forget all
+        elif op not in (0x23, 0x63):          # stores and branches write no register
+            rd = (word >> 7) & 31
+            self.known.pop(rd, None)
+            if op == 0x37 and kind == 'fixed' and rd:
+                self.known[rd] = word >> 12
+
+    def lui(self, rd, hi):
+        """LUI, left out when rd already holds this value (back-to-back device or MEM access)."""
+        if self.known.get(rd) != hi:
+            self.ins('lui', rd, hi)
 
     def data(self, word, text):
         return self._put(word, text, kind='data')
@@ -2477,7 +2496,7 @@ class Compiler:
         if fits12(s32(addr)):
             return ZERO, s32(addr)
         hi, lo = split_hi_lo(addr)
-        self.em.ins('lui', T0, hi)
+        self.em.lui(T0, hi)
         return T0, lo
 
     def leaf_obj(self, o):
@@ -2526,7 +2545,7 @@ class Compiler:
             self.em.ins('add', T1, r, GP)
             return T1, o.addr - self.gpval
         hi, lo = split_hi_lo(o.addr)
-        self.em.ins('lui', T0, hi)
+        self.em.lui(T0, hi)
         self.em.ins('add', T1, r, T0)
         return T1, lo
 
