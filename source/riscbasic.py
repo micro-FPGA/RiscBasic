@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-RiscBasic compiler v0.26
+RiscBasic compiler v0.27
 (v0.2: compressed instructions for RV32IC / RV32EC; v0.3: branch shrinking and far branches;
- v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers; v0.14: WRITEONLY registers with shadow; v0.15: REPEAT ... UNTIL; v0.16: CASE ranges; v0.17: CASE IS; v0.18: single-line ELSE binds to the nearest IF; v0.19: ':' separator; v0.20: strings; v0.21: LEN and string comparison; v0.22: LEFT$ RIGHT$ MID$ INSTR; v0.23: VAL; v0.24: .include; v0.25: #IF conditional compilation; v0.26: MEM[addr])
+ v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers; v0.14: WRITEONLY registers with shadow; v0.15: REPEAT ... UNTIL; v0.16: CASE ranges; v0.17: CASE IS; v0.18: single-line ELSE binds to the nearest IF; v0.19: ':' separator; v0.20: strings; v0.21: LEN and string comparison; v0.22: LEFT$ RIGHT$ MID$ INSTR; v0.23: VAL; v0.24: .include; v0.25: #IF conditional compilation; v0.26: MEM[addr]; v0.27: SUB BoardInit)
 
-Compiles RiscBasic (spec: RiscBasic-Spec.md, Draft 0.25) directly to RISC-V
+Compiles RiscBasic (spec: RiscBasic-Spec.md, Draft 0.26) directly to RISC-V
 machine code in a single pass, without a linker.
 
     python riscbasic.py program.bas [-o outbase] [--no-lst]
@@ -22,7 +22,7 @@ import os
 import re
 import sys
 
-VERSION = '0.26'
+VERSION = '0.27'
 
 # ---------------------------------------------------------------- registers
 
@@ -2060,6 +2060,8 @@ class Compiler:
                 w, sg, isbit = TYPES[rtype]
             if len(params) > len(PARAM_REGS):
                 raise RBError('%s %s: at most %d parameters' % (kind, name, len(PARAM_REGS)), n)
+            if name == 'BOARDINIT' and (kind != 'SUB' or params):
+                raise RBError('BoardInit is called at startup: it must be a SUB without parameters', n)
             busy = set(PARAM_REGS[i] for i in range(len(params)))
             if kind == 'FUNCTION' and strsize is None:
                 busy.add(A0)
@@ -3253,6 +3255,9 @@ class Compiler:
         if self.has_irq:
             em.la(T1, '__trap')
             em.ins('csrrw', ZERO, CSRS['mtvec'], T1)
+        f = self.funcs.get('BOARDINIT')
+        if f is not None:                   # SUB BoardInit runs before the BASIC program (checked in prescan)
+            em.ins('jal', RA, f['label'])
         em.head('program')
         em.label('main')                    # where the BASIC program starts (debuggers stop here)
         em.line = line

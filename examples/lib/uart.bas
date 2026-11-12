@@ -1,9 +1,11 @@
 '
 '
 '
- 
 CONST CR = 13
 CONST LF = 10
 
 CONSOLE UART0
 
+SUB NewLine
+  PRINT CR, LF
+END SUB

@@ -1,6 +1,6 @@
 # RiscBasic — Language Specification
 
-**Draft 0.25** — 12 November 2026 (7 AG)
+**Draft 0.26** — 12 November 2026 (7 AG)
 Language design: Antti Lukats (Identor #1). Drafting: Claude (Identor #9).
 
 ---
@@ -387,6 +387,7 @@ END IRQ
 - **Register variables are global.** A SUB or FUNCTION sees and may change every register variable, so no registers are saved by the callee except `RA`. This differs from the standard RISC-V ABI, where `S` registers are callee-saved.
 - A global register variable that sits in an argument register (`A0`–`A4`, `A6`, `A7`) is saved by the caller around each call that uses that register, and restored afterwards. Inside a SUB, such a global is hidden by the parameter in the same register; using it there is a compile error.
 - Recursion is allowed. Stack use is checked against `STACK` at compile time where the call depth is known.
+- **`SUB BoardInit`**: if the program has a SUB of this name, the startup code calls it once, after the stack, `GP` and RAM clearing are set up and before the `main` label, where the BASIC program starts. It may be defined anywhere, also in an included file or inside an `#IF` branch (a board file can bring its own). It must be a `SUB` without parameters. Interrupts are not yet enabled when it runs. A program that also calls it with `CALL` runs it twice.
 
 ---
 
@@ -601,7 +602,8 @@ LOOP
 | 33 | Include files | `.include "file.bas"`: textual, each file once, search the including file's directory then `-I` | 0.23 |
 | 34 | Conditional compilation | `#IF` / `#ELSEIF` / `#ELSE` / `#ENDIF` on CONSTs defined above, `DEFINED(name)`, `#ERROR`, `-D NAME=value` | 0.24 |
 | 35 | Memory access | `MEM[addr]` (32-bit) and `MEM8` / `MEM16` / `MEM32` with `[ ]` or `( )`; full 32-bit address; fields and bits also with a computed address | 0.25 |
+| 36 | Board initialization | a `SUB BoardInit` (no parameters) is called by the startup code before `main` | 0.26 |
 
 ## 14. Open questions
 
-None at Draft 0.25.
+None at Draft 0.26.
