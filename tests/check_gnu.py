@@ -6,7 +6,8 @@ For every test program on every target:
   1. objdump -d -M no-aliases decodes each instruction; address, encoding, mnemonic and
      registers must match the compiler's own listing.
   2. objcopy -O binary from the .elf must equal the compiler's .bin.
-  3. readelf -a must run without warnings.
+  3. readelf -a must run without warnings; the decoded DWARF line table (file, line, address)
+     must match the compiler's own rows, including rows in .include files.
   4. mem2elf on the .mem file, then objcopy, must give the .bin again.
 
     python tests/check_gnu.py [--prefix G:/gcc/bin/riscv-none-elf-]
@@ -97,7 +98,7 @@ def main():
         for name, body, expect, targets, irq_at, check in T.TESTS:
             for target in targets:
                 programs += 1
-                c = rb.Compiler('test.bas')
+                c = T.make_compiler('test.bas', body)
                 c.compile(T.PRELUDE.format(target=target) + body)
                 base = os.path.join(tmp, 'p%d' % programs)
                 elf, binf, memf = base + '.elf', base + '.bin', base + '.mem'
@@ -126,10 +127,11 @@ def main():
                 r = subprocess.run([prefix + 'readelf', '--debug-dump=decodedline', elf],
                                    capture_output=True, text=True, check=True)
                 decoded = []
+                names = {f['name']: k for k, f in enumerate(c.files)}      # readelf prints names as stored
                 for line in r.stdout.splitlines():
                     t = line.split()
-                    if len(t) >= 3 and t[0] == 'test.bas' and t[1].isdigit():
-                        decoded.append((int(t[2], 16), int(t[1])))      # address 0 is printed as '0'
+                    if len(t) >= 3 and t[0] in names and t[1].isdigit():
+                        decoded.append((int(t[2], 16), names[t[0]], int(t[1])))   # address 0 is printed as '0'
                 expect_rows = c.line_rows()
                 if decoded != expect_rows:
                     problems.append('DWARF line table differs: GNU %s... ours %s...'

@@ -1,6 +1,6 @@
 # RiscBasic — Language Specification
 
-**Draft 0.22** — 11 November 2026 (7 AG)
+**Draft 0.25** — 12 November 2026 (7 AG)
 Language design: Antti Lukats (Identor #1). Drafting: Claude (Identor #9).
 
 ---
@@ -33,6 +33,49 @@ STACK  256             ' top of RAM, grows down
 - Comments start with `'` or `REM`.
 - `:` separates statements on one line: `s = 0 : FOR i = 1 TO 4 : s = s + i : NEXT`. Blocks may open and close on the same line. A `:` inside `( )` or `[ ]` (as in `R10[7:4]`) and the width in `REG ... : 8` are not separators. `name:` at the start of a line is a label, unless `name` is a SUB or FUNCTION (then it is a call). `REM` after a `:` comments out the rest of the line.
 
+### 2.1 Include files
+
+```basic
+.include "lib/uart0.bas"      ' device declarations, CONSOLE, shared SUBs
+```
+
+- The lines of the named file replace the `.include` line, as if they were typed there. The program is still one source and one compile: no linker, no object files.
+- The directive stands alone on its line. A `'` comment may follow; a `:` separator may not. `.include` is not case sensitive.
+- A relative name is searched first in the directory of the file that contains the `.include`, then in the directories given with `-I DIR` on the command line, in order. An absolute path is used as it is.
+- Each file is included **once**. A second `.include` of the same file is skipped, so a library can include what it needs without double declarations. A file that includes itself, directly or through other files, is a compile error.
+- Includes nest: an included file may include further files.
+- Errors and warnings name the included file and its own line: `lib/uart0.bas:18: error: ...`.
+
+### 2.2 Conditional compilation
+
+```basic
+#IF NOT DEFINED(BOARD)          ' default when the command line has no -D BOARD=...
+CONST BOARD = 1
+#ENDIF
+
+#IF BOARD = 1
+  .include "board1.bas"
+#ELSEIF BOARD = 2
+  .include "board2.bas"
+#ELSE
+  #ERROR "BOARD must be 1 or 2"
+#ENDIF
+
+#IF DEFINED(DEBUG)
+PRINT "x = ", DEC x, CR, LF
+#ENDIF
+```
+
+- `#IF cond`, `#ELSEIF cond`, `#ELSE`, `#ENDIF` (also `#END IF`) choose which lines are compiled. Lines in a branch that is off are not compiled at all: they may hold other definitions of the same names, or text that is not BASIC.
+- The condition is a constant expression: numbers, `CONST` names defined **above** the `#IF` line (also in included files), operators, and `DEFINED(name)`, which is 1 if a `CONST` of that name exists. It is true when it is not 0. An unknown name is an error, so a typing error does not quietly switch code off; test with `DEFINED(name)` when a `CONST` may be missing.
+- `NOT` works as in the rest of the language: on a comparison or `DEFINED()` it is a logical NOT; on a number it inverts all bits, so `NOT 1` is `&HFFFFFFFE`, which is true. Write `#IF DEBUG = 0` rather than `#IF NOT DEBUG`.
+- `#IF` blocks nest. An `#IF` opened in a file must be closed in the same file.
+- `.include` inside a branch that is off is not read; the file does not even need to exist.
+- `#ERROR "text"` stops the compile with that message, when its branch is on.
+- `-D NAME` or `-D NAME=value` on the command line defines `CONST NAME` before the first line (default value 1): `python riscbasic.py prog.bas -D DEBUG -D BOARD=2`.
+- Each directive stands alone on its line, starting with `#`; a `'` comment may follow it.
+- The listing shows the directive lines, and the lines of a branch that is off with `(off)`: `; 0012  (off) CONST BOARD = 1`.
+
 ---
 
 ## 3. Objects
@@ -45,7 +88,7 @@ Everything that can appear on either side of `=` is an object with a **kind**, a
 | Register bit | `R10.0` or `R10[0]` | single bit |
 | Register field | `R10[7:4]` | bits 7 to 4, right-aligned when read |
 | Variable | `count` | in RAM, or pinned to a register |
-| Memory | `MEM8(addr)`, `MEM16(addr)`, `MEM32(addr)` | raw access; parentheses keep `[ ]` free for fields |
+| Memory | `MEM[addr]`, `MEM8[addr]`, `MEM16[addr]`, `MEM32[addr]` | raw access to any 32-bit address (3.4) |
 | Device register | `UART0.DATA` | memory-mapped |
 | Device bit or field | `GPIO.OUT.3`, `TIMER.CTRL[2:0]` | read-modify-write, or set/clear registers if declared |
 | Alias | `LED` | a name for any object above |
@@ -148,7 +191,7 @@ PRINT HEX GPIO.OUT         ' reads the shadow, not the hardware
 - Writing a register declared `SETS` or `CLEARS` for a `WRITEONLY` register also updates the shadow, so the shadow stays correct.
 - The shadow is one RAM variable of the register's width, created only when the register is used. It appears in the ELF symbol table as `DEVICE.REG.shadow`.
 - The shadow starts at 0 (RAM is cleared at startup). If the hardware resets to another value, write the whole register once at the start of the program.
-- Raw `MEMn(addr)` access does not use the shadow.
+- Raw `MEM[addr]` access does not use the shadow.
 - `READONLY` and `WRITEONLY` together are an error.
 
 ### 3.3 Variables
@@ -165,6 +208,23 @@ Types: `BIT`, `BYTE`, `HALF` (16-bit), `WORD` (32-bit), and signed `SBYTE`, `SHA
 - **Register variables** (`IN Rn`) always live in their register.
 - Startup code sets `GP = RAM base + 2048`, so variables in the first 4 KB of RAM are reached with one `LW` / `SW` and a 12-bit offset.
 - `BIT` variables in RAM take one byte each.
+
+### 3.4 Memory access (MEM)
+
+```basic
+MEM[&H4400_0000] = &H1234_5678     ' write a 32-bit word anywhere in the 4 GB address space
+v = MEM[&HFFFF_FFFC]               ' read the top word
+MEM[base + 4 * i] = v              ' the address can be any expression
+MEM8[p] = 13 : x = MEM16[p + 2]    ' byte and halfword access
+MEM[p][15:8] = &HAB                ' a field of a memory word (read-modify-write)
+IF MEM[p].31 THEN ...              ' a bit
+```
+
+- `MEM[addr]` is a 32-bit word; `MEM8`, `MEM16` and `MEM32` give the width. Reads of `MEM8` and `MEM16` are zero-extended.
+- The address is a full 32-bit value: a constant or any expression. Parentheses work too: `MEM32(addr)` is the same as `MEM32[addr]`. The first `[ ]` after `MEM` is the address; a second `[hi:lo]` or `.n` selects bits.
+- A constant address costs no extra instruction when it is within 2 KB of `GP` (RAM) or of address 0 (also the top 2 KB, `&HFFFF_F800` to `&HFFFF_FFFF`); otherwise one `LUI` is added. A computed address is evaluated into a register first.
+- The address is not checked for alignment. A misaligned `MEM16` or `MEM` access does what the core does with it (trap or split access).
+- `MEM`, `MEM8`, `MEM16` and `MEM32` are reserved words.
 
 ---
 
@@ -431,14 +491,14 @@ Variables and aliases can be used by name inside `ASM` blocks.
 
 - Single pass. Forward jumps are backpatched at the end.
 - Startup code: set `SP` and `GP`, clear RAM variables, jump to the first statement.
-- Output formats: `.bin`, Intel `.hex`, `.mem` for `$readmemh` (BRAM initialisation on FPGAs), and `.elf` (ELF32 RISC-V executable with symbols and DWARF source-line information, for debuggers and simulators).
+- Output formats: `.bin`, Intel `.hex`, `.mem` for `$readmemh` (BRAM initialisation on FPGAs), and `.elf` (ELF32 RISC-V executable with symbols and DWARF source-line information, for debuggers and simulators). The DWARF line table lists every included file, so a debugger can set breakpoints in them (`break lib/uart0.bas:18`).
 - Compile error if the code exceeds `CODE SIZE`. The size of each `SUB`, `FUNCTION` and runtime routine is reported.
 
 ### 11.1 Listing file (.LST)
 
 A `.LST` file is **always written by default**, next to the source: `program.bas` gives `program.lst`. `--no-lst` turns it off.
 
-- Each RiscBasic source line appears as a comment, with its line number, directly above the instructions generated for it.
+- Each RiscBasic source line appears as a comment, with its line number, directly above the instructions generated for it. Lines from an included file carry the file name too: `; lib/uart0.bas:0018  PRINT CR, LF`.
 - Each instruction line shows the address, the machine code in hex and the disassembly with ABI register names.
 - Runtime routines, string constants and startup code are listed the same way, under their own headings.
 - The file ends with a summary: code size per `SUB` / `FUNCTION` / runtime routine, total code used of `CODE SIZE`, and RAM used of `RAM SIZE`.
@@ -538,7 +598,10 @@ LOOP
 | 30 | LEN and string comparison | `LEN(s)`; `=` `<>` `<` `>` `<=` `>=` on strings, unsigned byte order | 0.20 |
 | 31 | Substrings and search | `LEFT$`, `RIGHT$`, `MID$` (from 1), `INSTR` (from 1, 0 = not found) | 0.21 |
 | 32 | VAL | Text to signed number: decimal, `&H` / `0x`, `&B` / `0b` | 0.22 |
+| 33 | Include files | `.include "file.bas"`: textual, each file once, search the including file's directory then `-I` | 0.23 |
+| 34 | Conditional compilation | `#IF` / `#ELSEIF` / `#ELSE` / `#ENDIF` on CONSTs defined above, `DEFINED(name)`, `#ERROR`, `-D NAME=value` | 0.24 |
+| 35 | Memory access | `MEM[addr]` (32-bit) and `MEM8` / `MEM16` / `MEM32` with `[ ]` or `( )`; full 32-bit address; fields and bits also with a computed address | 0.25 |
 
 ## 14. Open questions
 
-None at Draft 0.22.
+None at Draft 0.25.

@@ -151,6 +151,8 @@ class Sim:
         self.steps = 0
         self.compressed = 0
         self.irq_pending = set()
+        # 4 KB each: around the sign boundary of LUI/ADDI and at the very top of the address space
+        self.far = [(0x7FFFF000, bytearray(0x2000)), (0xFFFFF000, bytearray(0x1000))]
 
     # ---- memory
 
@@ -161,6 +163,9 @@ class Sim:
             return self.ram, addr - self.ram_base
         if 0x40002000 <= addr and addr + size <= 0x40003000:
             return self.plain, addr - 0x40002000
+        for base, buf in self.far:              # small memories spread over the 32-bit space
+            if base <= addr and addr + size <= base + len(buf):
+                return buf, addr - base
         return None, None
 
     def load(self, addr, size, signed):

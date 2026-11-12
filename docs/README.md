@@ -4,13 +4,15 @@ A BASIC-like language for RISC-V, compiled directly to machine code: single pass
 
 Language design: Antti Lukats (Identor #1). Compiler: Claude (Identor #9). 10 November 2026 (7 AG).
 
-- `RiscBasic-Spec.md`: the language specification (Draft 0.22)
+- `RiscBasic-Spec.md`: the language specification (Draft 0.25)
 - `riscbasic.py`: the compiler (Python 3, no dependencies)
 - `rbsim.py`: a small RV32I/M/C/Zbb simulator used for testing
 - `mem2elf.py`: converts a `.mem` file into an ELF executable
 - `tests/run_tests.py`: the test suite
 - `tests/check_gnu.py`: cross-check against the GNU RISC-V toolchain (objdump, objcopy, readelf)
 - `examples/example.bas`: the example from spec section 12
+- `examples/include_demo.bas`: uses `.include "lib/uart0.bas"` for the console declarations
+- `examples/conditional.bas`: `#IF` builds for two boards, with and without debug output
 
 ## Usage
 
@@ -18,6 +20,8 @@ Language design: Antti Lukats (Identor #1). Compiler: Claude (Identor #9). 10 No
 python riscbasic.py program.bas            # writes program.bin .hex .mem .lst .elf
 python riscbasic.py program.bas -o build/x # other output name
 python riscbasic.py program.bas --no-lst   # no listing (--no-elf: no ELF, --no-debug: no DWARF)
+python riscbasic.py program.bas -I lib     # also search lib/ for .include files
+python riscbasic.py program.bas -D DEBUG -D BOARD=2   # CONSTs for #IF (default value 1)
 python mem2elf.py program.mem --base 0 --arch rv32imc   # .mem -> .elf
 python rbsim.py program.bin                # run in the test simulator
 python tests/run_tests.py                  # run all tests
@@ -95,7 +99,7 @@ Steps over all test programs (RV32IC): branch shrinking saved 3.3%, runtime call
 
 ## Status and differences from the spec
 
-Implemented: everything in Draft 0.22 sections 2–11, including active-low `NOT` bits and fields (3.2.1), except for the points below.
+Implemented: everything in Draft 0.25 sections 2–11, including active-low `NOT` bits and fields (3.2.1), except for the points below.
 
 1. **Compressed instructions**: see above.
 2. **Recursion.** Parameters and `DIM` inside a SUB are not saved across a recursive call (locals are static RAM). Recursion works only if the SUB does not need its parameters after the recursive call.

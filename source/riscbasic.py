@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-RiscBasic compiler v0.24
+RiscBasic compiler v0.26
 (v0.2: compressed instructions for RV32IC / RV32EC; v0.3: branch shrinking and far branches;
- v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers; v0.14: WRITEONLY registers with shadow; v0.15: REPEAT ... UNTIL; v0.16: CASE ranges; v0.17: CASE IS; v0.18: single-line ELSE binds to the nearest IF; v0.19: ':' separator; v0.20: strings; v0.21: LEN and string comparison; v0.22: LEFT$ RIGHT$ MID$ INSTR; v0.23: VAL; v0.24: .include)
+ v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers; v0.14: WRITEONLY registers with shadow; v0.15: REPEAT ... UNTIL; v0.16: CASE ranges; v0.17: CASE IS; v0.18: single-line ELSE binds to the nearest IF; v0.19: ':' separator; v0.20: strings; v0.21: LEN and string comparison; v0.22: LEFT$ RIGHT$ MID$ INSTR; v0.23: VAL; v0.24: .include; v0.25: #IF conditional compilation; v0.26: MEM[addr])
 
-Compiles RiscBasic (spec: RiscBasic-Spec.md, Draft 0.23) directly to RISC-V
+Compiles RiscBasic (spec: RiscBasic-Spec.md, Draft 0.25) directly to RISC-V
 machine code in a single pass, without a linker.
 
     python riscbasic.py program.bas [-o outbase] [--no-lst]
@@ -22,7 +22,7 @@ import os
 import re
 import sys
 
-VERSION = '0.24'
+VERSION = '0.26'
 
 # ---------------------------------------------------------------- registers
 
@@ -866,7 +866,7 @@ KEYWORDS = DECLARATIONS | {
     'DELAY_MS', 'PRINT', 'INPUT', 'LINE', 'HEX', 'DEC', 'CHR', 'SHL', 'SHR', 'SAR', 'ROL', 'ROR',
     'ATOMIC', 'ASM', 'LET', 'AND', 'OR', 'XOR', 'NOT', 'MOD', 'AS', 'IN',
     'AT', 'SIZE', 'REG', 'BIT', 'FIELD', 'READONLY', 'WRITEONLY', 'SETS', 'CLEARS',
-    'MEM8', 'MEM16', 'MEM32', 'STRING', 'CHR$', 'DEC$', 'HEX$', 'LEN',
+    'MEM', 'MEM8', 'MEM16', 'MEM32', 'STRING', 'CHR$', 'DEC$', 'HEX$', 'LEN',
     'LEFT$', 'RIGHT$', 'MID$', 'INSTR', 'VAL'}
 
 
@@ -1758,6 +1758,9 @@ class Compiler:
         self.include_dirs = []    # extra directories searched by .include (command line -I)
         self.files = []           # source files: dict(name, path, dir); index 0 is the main file
         self.fno = 0              # index of the file the current line comes from
+        self.defines = {}         # CONSTs from the command line (-D NAME=value), name -> text
+        self.pre_consts = set()   # (file, line, name) of CONSTs already defined by the preprocessing pass
+        self.in_pp = False        # True while an #IF condition is evaluated (enables DEFINED())
         self.em = Emitter()
         self.ext = self.em.ext
         self.target = 'RV32I'
@@ -1809,16 +1812,17 @@ class Compiler:
             self.once.add(key)
             chain.append(key)
         try:
+            self.apply_defines()
             lines = self.expand(src, 0, chain)
             self.prescan(lines)
-            for fno, n, raw, inc in lines:
+            for fno, n, raw, kind in lines:
                 self.fno, self.line = fno, n
                 self.em.line = (fno, n)
                 try:
-                    if inc:
-                        self.em.comment(self.src_tag() + raw.strip())
-                    else:
+                    if kind == 'code':
                         self.process(raw)
+                    elif raw.strip():           # .include, #IF lines; 'off' = not compiled by #IF
+                        self.em.comment(self.src_tag() + ('(off) ' if kind == 'off' else '') + raw.strip())
                 except RBError as e:
                     if e.line is None:
                         e.line = (fno, n)
@@ -1843,13 +1847,61 @@ class Compiler:
     def _file_key(path):
         return os.path.normcase(os.path.realpath(path))
 
+    PP_RE = re.compile(r'^\s*#\s*(IF|ELSEIF|ELSE|ENDIF|END\s+IF|ERROR)\b(.*)$', re.I)
+
     def expand(self, src, fno, chain):
-        """Source lines as (file index, line number, text, is_include), included files spliced in."""
+        """Preprocessing pass, in source order: #IF / #ELSEIF / #ELSE / #ENDIF, #ERROR, .include, and CONST
+        definitions (so that later #IF lines can use them). Returns (file index, line number, text, kind)
+        with kind 'code', 'inc' (.include line), 'dir' (#IF line) or 'off' (left out by #IF)."""
         out = []
+        conds = []            # open #IFs of this file: dict(parent, taken, else_seen, line)
+        active = True
         for n, raw in enumerate(src.splitlines(), 1):
+            self.fno, self.line = fno, n
+            m = self.PP_RE.match(raw)
+            if m:
+                kw = '#' + re.sub(r'\s+', '', m.group(1).upper())
+                rest = strip_comment(m.group(2)).strip()
+                if kw == '#ERROR':
+                    if active:
+                        em = re.match(r'^"([^"]*)"$', rest)
+                        if not em:
+                            raise RBError('#ERROR needs a message in quotes: #ERROR "text"')
+                        raise RBError('#ERROR: %s' % em.group(1))
+                elif kw == '#IF':
+                    taken = active and self.pp_cond(rest, kw)
+                    conds.append({'parent': active, 'taken': taken, 'else_seen': False, 'line': n})
+                    active = taken
+                else:
+                    if not conds:
+                        raise RBError('%s without #IF' % kw)
+                    c = conds[-1]
+                    if kw == '#ELSEIF':
+                        if c['else_seen']:
+                            raise RBError('#ELSEIF after #ELSE')
+                        active = c['parent'] and not c['taken'] and self.pp_cond(rest, kw)
+                        c['taken'] = c['taken'] or active
+                    else:
+                        if rest:
+                            raise RBError("unexpected '%s' after %s" % (rest, kw))
+                        if kw == '#ELSE':
+                            if c['else_seen']:
+                                raise RBError('second #ELSE for the same #IF')
+                            c['else_seen'] = True
+                            active = c['parent'] and not c['taken']
+                            c['taken'] = True
+                        else:
+                            conds.pop()
+                            active = c['parent']
+                out.append((fno, n, raw, 'dir'))
+                continue
+            if not active:
+                out.append((fno, n, raw, 'off'))
+                continue
             m = self.INCLUDE_RE.match(raw)
             if not m:
-                out.append((fno, n, raw, False))
+                self.pre_const(raw)
+                out.append((fno, n, raw, 'code'))
                 continue
             arg = strip_comment(m.group(1)).strip()
             fm = re.match(r'^"([^"]+)"$', arg)
@@ -1861,7 +1913,7 @@ class Compiler:
             key = self._file_key(path)
             if key in chain:
                 raise RBError("circular .include of '%s'" % fm.group(1), (fno, n))
-            out.append((fno, n, raw, True))
+            out.append((fno, n, raw, 'inc'))
             if key in self.once:            # each file is included only once
                 continue
             self.once.add(key)
@@ -1878,7 +1930,64 @@ class Compiler:
             self.files.append({'name': name.replace(os.sep, '/'), 'path': full,
                                'dir': os.path.dirname(full)})
             out += self.expand(text, len(self.files) - 1, chain + [key])
+        if conds:
+            raise RBError('#IF without #ENDIF', (fno, conds[-1]['line']))
         return out
+
+    def pp_cond(self, text, kw):
+        """Value of an #IF / #ELSEIF condition: a constant expression of numbers and CONSTs
+        defined above it; DEFINED(name) tests whether a CONST exists."""
+        if not text:
+            raise RBError('%s needs a condition' % kw)
+        saved = self.t, self.i
+        self.t, self.i, self.in_pp = lex(text), 0, True
+        try:
+            n = self.expr()
+            self.expect_end()
+        except RBError as e:
+            if e.msg.startswith('unknown name'):
+                e.msg += ' (%s can use CONSTs defined above it; DEFINED(name) tests for one)' % kw
+            raise
+        finally:
+            self.t, self.i = saved
+            self.in_pp = False
+        if n.k != 'const':
+            raise RBError('%s needs a constant condition: numbers, CONSTs and DEFINED(name)' % kw)
+        return n.a != 0
+
+    def pre_const(self, raw):
+        """Define the CONSTs of an active line now, so that #IF lines below can use them.
+        The main pass skips these CONSTs (see st_const)."""
+        if 'CONST' not in raw.upper():
+            return
+        try:
+            toks = lex(strip_comment(raw))
+        except RBError:                     # not BASIC (an ASM line); the main pass reports real errors
+            return
+        while toks:
+            j = self.next_colon(toks)
+            seg, toks = toks[:j], toks[j + 1:]
+            if seg and seg[0].kind == 'id' and seg[0].up == 'REM':
+                break
+            if len(seg) > 1 and seg[0].kind == 'id' and seg[0].up == 'CONST' and seg[1].kind == 'id':
+                self.sub_stmt(seg)
+                self.pre_consts.add((self.fno, self.line, seg[1].up))
+
+    def apply_defines(self):
+        """-D NAME[=value] from the command line: CONSTs that exist before the first source line."""
+        for name, text in self.defines.items():
+            u = name.upper()
+            if not re.match(r'^[A-Z_]\w*$', u):
+                raise RBError("-D: bad name '%s'" % name, 0)
+            self.t, self.i = lex(text), 0
+            try:
+                self.check_newname(u)
+                self.consts[u] = self.const_expr()
+                self.expect_end()
+            except RBError as e:
+                raise RBError('-D %s=%s: %s' % (name, text, e.msg), 0)
+            finally:
+                self.t, self.i = [], 0
 
     def find_include(self, name, here):
         if os.path.isabs(name):
@@ -1913,9 +2022,9 @@ class Compiler:
     def prescan(self, lines):
         sig_re = re.compile(r'^\s*(SUB|FUNCTION)\s+([A-Za-z_]\w*)\s*(?:\(([^)]*)\))?\s*'
                             r'(?:AS\s+([A-Za-z]+)(?:\s*\*\s*(\w+))?)?\s*(?::.*)?$', re.I)
-        for fno, ln, raw, inc in lines:
+        for fno, ln, raw, kind in lines:
             n = (fno, ln)
-            if inc:
+            if kind != 'code':
                 continue
             s = strip_comment(raw)
             if re.match(r'^\s*ON\s+IRQ\b', s, re.I):
@@ -1926,6 +2035,8 @@ class Compiler:
             kind, name = m.group(1).upper(), m.group(2).upper()
             if name in self.funcs:
                 raise RBError("%s '%s' defined twice" % (kind, name), n)
+            if name in self.consts:
+                raise RBError("'%s' is already defined" % name, n)
             params = []
             if m.group(3) and m.group(3).strip():
                 for p in m.group(3).split(','):
@@ -2109,6 +2220,12 @@ class Compiler:
 
     def primary(self):
         tok = self.peek()
+        if self.in_pp and tok.kind == 'id' and tok.up == 'DEFINED':
+            self.i += 1
+            self.expect_op('(')
+            u = self.expect_id().up
+            self.expect_op(')')
+            return Node('const', int(u in self.consts), isbool=True)
         if tok.kind == 'num':
             self.i += 1
             return Node('const', tok.val)
@@ -2165,13 +2282,15 @@ class Compiler:
         raise RBError("value expected, found '%s'" % tok)
 
     def mk_bin(self, op, l, r):
-        if l.k == 'const' and r.k == 'const':
-            return Node('const', fold(op, l.a, r.a))
         isb = op in CMP_OPS or (op in ('AND', 'OR', 'XOR') and l.isbool and r.isbool)
+        if l.k == 'const' and r.k == 'const':
+            return Node('const', fold(op, l.a, r.a), isbool=isb)
         return Node('bin', (op, l, r), signed=l.signed or r.signed, isbool=isb)
 
     def mk_un(self, op, x):
         if x.k == 'const':
+            if op == 'NOT' and x.isbool:            # logical, as at run time: NOT (A = 1)
+                return Node('const', 1 - (x.a != 0), isbool=True)
             return Node('const', -x.a if op == '-' else ~x.a)
         return Node('un', (op, x), signed=x.signed, isbool=(op == 'NOT' and x.isbool))
 
@@ -2227,11 +2346,15 @@ class Compiler:
                 o = Obj('arr', u, addr=o.addr, width=o.width, signed=o.signed,
                         isbit=o.isbit, count=o.count, index=idx)
             node = self.obj_node(o)
-        elif u in ('MEM8', 'MEM16', 'MEM32'):
-            self.expect_op('(')
+        elif u in ('MEM', 'MEM8', 'MEM16', 'MEM32'):
+            # MEM[addr] is a 32-bit word; MEMn[addr] and MEMn(addr) give the width.
+            # The address is a full 32-bit value; a [hi:lo] or .n after it selects bits.
+            close = ']' if self.accept_op('[') else ')'
+            if close == ')':
+                self.expect_op('(')
             a = self.expr()
-            self.expect_op(')')
-            w = int(u[3:])
+            self.expect_op(close)
+            w = int(u[3:] or 32)
             if a.k == 'const':
                 o = Obj('loc', u, width=w, addr=a.a & 0xFFFFFFFF)
             else:
@@ -2883,6 +3006,29 @@ class Compiler:
             if base.width < 32 and base.signed and lo + w == base.width:
                 self.normalize_reg(rd, base)
             return
+        if base.kind == 'loc' and base.addr is None:     # MEM[expr]: address computed at run time
+            ld, st = self.ld(base.width, False), self.st(base.width)
+            if n.k == 'const':
+                a = self.gen(base.aexpr, T1)
+                em.ins(ld, T2, 0, a)
+                if setbits != mask:
+                    self.and_not(T2, T2, mask, T0)
+                if setbits:
+                    self.or_imm(T2, T2, setbits, T0)
+                em.ins(st, T2, 0, a)
+                return T2
+            self.gen(n, T1, True)
+            self.position(n, lo, w, o.inv)
+            self.push(T1)                           # the value waits on the stack
+            a = self.gen(base.aexpr, T1)
+            if a != T2:
+                em.ins('addi', T2, a, 0)            # address in T2
+            em.ins(ld, T1, 0, T2)
+            self.and_not(T1, T1, mask, T0)
+            self.pop(T0)
+            em.ins('or', T1, T1, T0)
+            em.ins(st, T1, 0, T2)
+            return T1
         if base.kind not in ('ram', 'loc') or base.addr is None:
             raise RBError('bit and field assignment needs a register, RAM variable or device register')
         if base.readonly:
@@ -3173,6 +3319,9 @@ class Compiler:
 
     def st_const(self):
         u = self.expect_id().up
+        if (self.fno, self.line, u) in self.pre_consts:     # defined by the preprocessing pass
+            self.i = len(self.t)
+            return
         self.check_newname(u)
         self.expect_op('=')
         self.consts[u] = self.const_expr()
@@ -4996,13 +5145,14 @@ def intel_hex(data, base):
     return '\n'.join(out) + '\n'
 
 
-def compile_file(path, outbase=None, lst=True, elf=True, debug=True, include_dirs=()):
+def compile_file(path, outbase=None, lst=True, elf=True, debug=True, include_dirs=(), defines=None):
     with open(path, encoding='utf-8-sig') as f:    # accepts files with or without a BOM
         src = f.read()
     c = Compiler(os.path.basename(path))
     c.src_dir = os.path.dirname(os.path.abspath(path))
     c.src_path = os.path.abspath(path)
     c.include_dirs = list(include_dirs)
+    c.defines = dict(defines or {})
     c.compile(src)
     outbase = outbase or os.path.splitext(path)[0]
     data = c.binary()
@@ -5031,12 +5181,18 @@ def main(argv=None):
     ap.add_argument('--no-debug', action='store_true', help='no DWARF line information in the .elf')
     ap.add_argument('-I', dest='include', action='append', default=[], metavar='DIR',
                     help="search DIR for .include files (after the including file's directory)")
+    ap.add_argument('-D', dest='define', action='append', default=[], metavar='NAME[=VALUE]',
+                    help='define CONST NAME (default value 1), e.g. -D DEBUG or -D BAUD=115200')
     a = ap.parse_args(argv)
+    defines = {}
+    for d in a.define:
+        name, _, value = d.partition('=')
+        defines[name.strip()] = value.strip() or '1'
     try:
-        c = compile_file(a.source, a.output, not a.no_lst, not a.no_elf, not a.no_debug, a.include)
+        c = compile_file(a.source, a.output, not a.no_lst, not a.no_elf, not a.no_debug, a.include, defines)
     except RBError as e:
-        print('%s:%s: error: %s' % (e.file or a.source, e.line if e.line is not None else '?', e.msg),
-              file=sys.stderr)
+        where = '' if e.line == 0 else ':%s' % (e.line if e.line is not None else '?')     # 0: command line
+        print('%s%s: error: %s' % (e.file or a.source, where, e.msg), file=sys.stderr)
         return 1
     except OSError as e:
         print('error: %s' % e, file=sys.stderr)

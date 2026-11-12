@@ -2,9 +2,11 @@
 """RiscBasic test suite: compile each program, run it in rbsim, check the UART output."""
 
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+INC = os.path.join(HERE, 'inc')      # .include fixtures: programs that include files compile from here
 sys.path.insert(0, os.path.dirname(HERE))
 
 from riscbasic import Compiler, RBError   # noqa: E402
@@ -782,6 +784,47 @@ MEM32(R13) = 99
 PRINT UART0, DEC MEM32(R13), 13, 10
 ''', '44 1122 11223344\r\n99\r\n')
 
+test('MEM[addr], full 32-bit addresses', '''
+DIM a AS WORD
+DIM v AS WORD
+MEM[&H8100] = &H11223344
+v = MEM[&H8100]
+PRINT UART0, HEX v, " ", HEX MEM8[&H8101], " ", HEX MEM16[&H8102], " ", HEX MEM32(&H8100), 13, 10
+MEM[&HFFFF_FFFC] = &HCAFE0001               ' top word of the address space: lw/sw off zero
+MEM[&HFFFF_F000] = 2                        ' lowest address reachable with a 12-bit offset
+MEM[&H7FFF_FFFC] = 3                        ' LUI 0x80000 + negative offset
+MEM[&H8000_0000] = 4
+MEM[&H7FFF_F800] = 5
+PRINT UART0, HEX MEM[&HFFFF_FFFC], " ", DEC MEM[&HFFFF_F000], " ", DEC MEM[&H7FFF_FFFC]
+PRINT UART0, " ", DEC MEM[&H8000_0000], " ", DEC MEM[&H7FFF_F800], 13, 10
+a = &HFFFF_FFFC                             ' address in a variable
+MEM[a] = MEM[a] + 1
+MEM[a - 4] = 7
+PRINT UART0, HEX MEM[a], " ", DEC MEM[a - 4], " ", DEC MEM[-8], 13, 10
+MEM[a][15:8] = &HAB                         ' field and bit of a memory word
+MEM[a].31 = 0
+PRINT UART0, HEX MEM[a], " ", HEX MEM[a][15:8], " ", DEC MEM[a].0, 13, 10
+FOR a = &H8000_0000 TO &H8000_000C STEP 4  ' word loop over far memory (signed FOR: stays negative)
+  MEM[a] = a
+NEXT
+PRINT UART0, HEX MEM[&H8000_0008], 13, 10
+''', '11223344 33 1122 11223344\r\nCAFE0001 2 3 4 5\r\nCAFE0002 7 7\r\n4AFEAB02 AB 0\r\n80000008\r\n')
+
+test('MEM[addr] fields with computed addresses', '''
+DIM p AS WORD IN R13
+DIM v AS WORD
+p = &H8200
+MEM[p] = 0
+MEM[p + 4] = &HFFFFFFFF
+v = &H12345
+MEM[p][23:4] = v                            ' wide field: the mask needs a register
+MEM8[p + 3].7 = 1
+MEM[p + 4][11:8] = v + 1                    ' computed value and address
+MEM16[p + 6][3:0] = 0
+IF MEM[p].31 AND NOT MEM[p].0 THEN PRINT UART0, "bits "
+PRINT UART0, HEX MEM[p], " ", HEX MEM[p + 4], " ", HEX p, 13, 10
+''', 'bits 80123450 FFF0F6FF 00008200\r\n')
+
 test('goto, labels, wait, delay', '''
 R12 = 0
 again:
@@ -922,7 +965,110 @@ PRINT UART0, "looped ", DEC R14, " ", HEX R12, 13, 10
 ''', 'looped 2 %08X\r\n' % (sum(0x10001 + k for k in range(520)) & 0xFFFFFFFF),
      targets=('RV32I', 'RV32IC'))
 
+test('include files', '''
+.include "util.bas"
+.include "consts.bas"          ' included already by util.bas: skipped
+.include "sub/deep.bas"
+Say "inc"
+PRINT UART0, DEC Twice(21), " ", DEC Plus1(9), CR, LF
+''', 'inc\r\n42 10\r\n')
+
+
+test('conditional compilation', '''
+CONST DEBUG = 1
+CONST LEVEL = 2 : CONST QUIET = 0       ' CONSTs on a ':' line are seen by #IF too
+.include "board.bas"                    ' defines BOARD = 2
+#IF DEBUG
+PRINT UART0, "d"
+#ELSE
+PRINT UART0, "x"
+#ENDIF
+#IF BOARD = 1
+.include "does_not_exist.bas"           ' not included: the branch is off
+FUNCTION Pick() AS WORD
+  RETURN 1
+END FUNCTION
+#ELSEIF BOARD = 2 AND LEVEL >= 2
+FUNCTION Pick() AS WORD                 ' same name as above: only one is compiled
+  RETURN 2
+END FUNCTION
+#ELSEIF BOARD = 2
+this is not BASIC, and it is never compiled
+#ELSE
+FUNCTION Pick() AS WORD
+  RETURN 3
+END FUNCTION
+#END IF
+PRINT UART0, DEC Pick()
+#IF NOT DEFINED(BAUD)                   ' default value pattern
+CONST BAUD = 9600
+#ENDIF
+#IF DEFINED(BAUD) AND NOT DEFINED(NOPE)
+PRINT UART0, " ", DEC BAUD
+#ENDIF
+#IF QUIET
+PRINT UART0, " quiet"
+#ELSE
+  #IF LEVEL > 1                         ' nested
+PRINT UART0, " L", DEC LEVEL
+  #ELSE
+PRINT UART0, " l"
+  #ENDIF
+#ENDIF
+#IF 0
+  #ERROR "not reached"
+  #IF UNKNOWN_NAME                      ' not evaluated inside an off branch
+  #ELSE
+  #ENDIF
+#ENDIF
+#if debug = 1 and not (level = 2)       ' lower case; NOT of a comparison is logical
+PRINT UART0, " wrong"
+#endif
+PRINT UART0, 13, 10
+''', 'd2 9600 L2\r\n')
+
+test('constant NOT of a comparison', '''
+CONST A = 1
+IF NOT (A = 1) THEN
+  PRINT UART0, "wrong"
+ELSE
+  PRINT UART0, "right"
+END IF
+R10 = NOT (A = 2)
+R11 = NOT A
+PRINT UART0, " ", DEC R10, " ", HEX R11, 13, 10
+''', 'right 1 FFFFFFFE\r\n')
+
+
+def make_compiler(name, body):
+    c = Compiler(name)
+    if '.include' in body.lower():
+        c.src_dir = INC
+    return c
+
+
 ERRORS = [
+    ('.include "nope.bas"', 'not found'),
+    ('#ENDIF', '#ENDIF without #IF'),
+    ('MEM[&H8100 = 1', "']' expected"),
+    ('MEM(&H8100] = 1', "')' expected"),
+    ('DIM mem AS WORD', 'reserved'),
+    ('#IF 1' + chr(10) + '#ERROR "stop here"' + chr(10) + '#ENDIF', '#ERROR: stop here'),
+    ('#ERROR stop', 'in quotes'),
+    ('#ELSE', '#ELSE without #IF'),
+    ('#IF 1', '#IF without #ENDIF'),
+    ('#IF', 'needs a condition'),
+    ('#IF NOPE' + chr(10) + '#ENDIF', 'unknown name'),
+    ('#IF R10' + chr(10) + '#ENDIF', 'constant condition'),
+    ('#IF 1' + chr(10) + '#ELSE' + chr(10) + '#ELSE' + chr(10) + '#ENDIF', 'second #ELSE'),
+    ('#IF 1' + chr(10) + '#ELSE' + chr(10) + '#ELSEIF 1' + chr(10) + '#ENDIF', '#ELSEIF after #ELSE'),
+    ('#IF 1' + chr(10) + '#ENDIF 1', "unexpected '1'"),
+    ('.include "open_if.bas"' + chr(10) + '#ENDIF', '#IF without #ENDIF'),
+    ('CONST K = 1' + chr(10) + 'FUNCTION K() AS WORD' + chr(10) + 'RETURN 1' + chr(10) + 'END FUNCTION',
+     'already defined'),
+    ('.include nope.bas', 'in quotes'),
+    ('.include "loop_a.bas"', 'circular'),
+    ('.include "bad.bas"', 'nothing_here'),
     ('R0 = 1', 'read-only'),
     ('S0 = 1', 'reserved'),
     ('DIM v AS WORD IN A5', 'cannot hold'),
@@ -986,7 +1132,7 @@ ERRORS = [
 
 def run_one(name, body, expect, target, irq_at, check):
     src = PRELUDE.format(target=target) + body
-    c = Compiler(name)
+    c = make_compiler(name, body)
     c.compile(src)
     s = Sim(c.binary(), c.em.base, c.ram_base, c.ram_size)
     s.gpio_in = 1
@@ -996,6 +1142,74 @@ def run_one(name, body, expect, target, irq_at, check):
     out = s.output()
     ok = done and out == expect and (check is None or check(s))
     return ok, out, done, c
+
+
+def check_conditionals():
+    """-D defines, the listing of #IF lines, and the position of an error in an open #IF."""
+    failed = 0
+    body = PRELUDE.format(target='RV32I') + '''
+#IF DEBUG
+PRINT UART0, "debug ", DEC BAUD
+#ELSE
+PRINT UART0, "release"
+#ENDIF
+'''
+    outs = []
+    for defines in ({}, {'DEBUG': '1', 'BAUD': '&H10'}):
+        c = Compiler('d.bas')
+        c.defines = defines
+        try:
+            c.compile(body.replace('#IF DEBUG', '#IF DEFINED(DEBUG)'))
+        except RBError as e:
+            outs.append('error %s' % e.msg)
+            continue
+        s = Sim(c.binary(), c.em.base, c.ram_base, c.ram_size)
+        s.run()
+        outs.append(s.output())
+    ok = outs == ['release', 'debug 16']
+    print('%s -D defines: %s' % ('ok  ' if ok else 'FAIL', outs))
+    failed += not ok
+    c = Compiler('d.bas')
+    c.compile(body.replace('#IF DEBUG', '#IF DEFINED(DEBUG)'))
+    lst = c.listing()
+    ok = (re.search(r'^; \d{4}  \(off\) PRINT UART0, "debug ", DEC BAUD$', lst, re.M) is not None and
+          re.search(r'^; \d{4}  #ELSE$', lst, re.M) is not None and '"release"' in lst)
+    print('%s #IF listing: off lines marked' % ('ok  ' if ok else 'FAIL'))
+    failed += not ok
+    try:
+        Compiler('d.bas').compile(PRELUDE.format(target='RV32I') + '#IF 1\nR10 = 1\n#IF 0\n#ENDIF\n')
+        where = 'no error'
+    except RBError as e:
+        where = '%s %s' % (e.line, e.msg)
+    ok = where == '%d #IF without #ENDIF' % (PRELUDE.count(chr(10)) + 1)
+    print('%s open #IF reported at its line: %s' % ('ok  ' if ok else 'FAIL', where))
+    failed += not ok
+    return failed
+
+
+def check_include_positions():
+    """Errors in included files name that file and its line; the listing and DWARF rows
+    point into the included files."""
+    failed = 0
+    try:
+        make_compiler('err', '.include').compile(PRELUDE.format(target='RV32I') + '.include "bad.bas"')
+        where = 'no error'
+    except RBError as e:
+        where = '%s:%s' % (e.file, e.line)
+    ok = where.replace(os.sep, '/').endswith('inc/bad.bas:3')
+    print('%s include error position: %s' % ('ok  ' if ok else 'FAIL', where))
+    failed += not ok
+    body = PRELUDE.format(target='RV32IC') + '.include "util.bas"\nSay "x"\n'
+    c = make_compiler('main.bas', body)
+    c.compile(body)
+    names = [f['name'] for f in c.files]
+    files_in_rows = sorted(set(names[f] for _, f, ln in c.line_rows() if ln))
+    lst = c.listing()
+    ok = (names == ['main.bas', 'util.bas', 'consts.bas'] and files_in_rows == ['main.bas', 'util.bas']
+          and '; util.bas:0009  PRINT UART0, t, CR, LF' in lst)
+    print('%s include listing and line rows: files %s, rows in %s' % ('ok  ' if ok else 'FAIL', names, files_in_rows))
+    failed += not ok
+    return failed
 
 
 def fuzz_rvc(n=4000, seed=7):
@@ -1103,7 +1317,7 @@ def main():
     for body, frag in ERRORS:
         target = 'RV32E' if 'R16' in body else 'RV32I'
         try:
-            Compiler('err').compile(PRELUDE.format(target=target) + body)
+            make_compiler('err', body).compile(PRELUDE.format(target=target) + body)
             print('FAIL error expected: %s' % body)
             failed += 1
         except RBError as e:
@@ -1112,6 +1326,8 @@ def main():
                 failed += 1
             else:
                 print('ok   error: %-26s -> %s' % (body, e.msg))
+    failed += check_include_positions()
+    failed += check_conditionals()
     print('\n%s' % ('all tests passed' if not failed else '%d test(s) failed' % failed))
     return 1 if failed else 0
 
