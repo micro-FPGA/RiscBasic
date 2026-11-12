@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-RiscBasic compiler v0.23
+RiscBasic compiler v0.24
 (v0.2: compressed instructions for RV32IC / RV32EC; v0.3: branch shrinking and far branches;
- v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers; v0.14: WRITEONLY registers with shadow; v0.15: REPEAT ... UNTIL; v0.16: CASE ranges; v0.17: CASE IS; v0.18: single-line ELSE binds to the nearest IF; v0.19: ':' separator; v0.20: strings; v0.21: LEN and string comparison; v0.22: LEFT$ RIGHT$ MID$ INSTR; v0.23: VAL)
+ v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers; v0.14: WRITEONLY registers with shadow; v0.15: REPEAT ... UNTIL; v0.16: CASE ranges; v0.17: CASE IS; v0.18: single-line ELSE binds to the nearest IF; v0.19: ':' separator; v0.20: strings; v0.21: LEN and string comparison; v0.22: LEFT$ RIGHT$ MID$ INSTR; v0.23: VAL; v0.24: .include)
 
-Compiles RiscBasic (spec: RiscBasic-Spec.md, Draft 0.22) directly to RISC-V
+Compiles RiscBasic (spec: RiscBasic-Spec.md, Draft 0.23) directly to RISC-V
 machine code in a single pass, without a linker.
 
     python riscbasic.py program.bas [-o outbase] [--no-lst]
@@ -22,7 +22,7 @@ import os
 import re
 import sys
 
-VERSION = '0.23'
+VERSION = '0.24'
 
 # ---------------------------------------------------------------- registers
 
@@ -58,10 +58,11 @@ def rname(r):
 
 
 class RBError(Exception):
-    def __init__(self, msg, line=None):
+    def __init__(self, msg, line=None, file=None):
         super().__init__(msg)
         self.msg = msg
         self.line = line
+        self.file = file      # name of an included file, None for the main source file
 
 
 def s32(v):
@@ -1753,6 +1754,10 @@ class Compiler:
     def __init__(self, fname='program.bas'):
         self.fname = fname
         self.src_dir = ''         # directory of the source file, for DWARF DW_AT_comp_dir
+        self.src_path = None      # full path of the main source file (None: compiled from a string)
+        self.include_dirs = []    # extra directories searched by .include (command line -I)
+        self.files = []           # source files: dict(name, path, dir); index 0 is the main file
+        self.fno = 0              # index of the file the current line comes from
         self.em = Emitter()
         self.ext = self.em.ext
         self.target = 'RV32I'
@@ -1795,27 +1800,123 @@ class Compiler:
     # ---- driver
 
     def compile(self, src):
-        lines = src.splitlines()
-        self.prescan(lines)
-        for n, raw in enumerate(lines, 1):
-            self.line = n
-            self.em.line = n
+        main_dir = self.src_dir or os.getcwd()
+        self.files = [{'name': self.fname, 'path': self.src_path, 'dir': main_dir}]
+        self.once = set()
+        chain = []
+        if self.src_path:
+            key = self._file_key(self.src_path)
+            self.once.add(key)
+            chain.append(key)
+        try:
+            lines = self.expand(src, 0, chain)
+            self.prescan(lines)
+            for fno, n, raw, inc in lines:
+                self.fno, self.line = fno, n
+                self.em.line = (fno, n)
+                try:
+                    if inc:
+                        self.em.comment(self.src_tag() + raw.strip())
+                    else:
+                        self.process(raw)
+                except RBError as e:
+                    if e.line is None:
+                        e.line = (fno, n)
+                    raise
+            if lines:
+                self.fno, self.line = lines[-1][0], lines[-1][1]
+            self.finish()
+        except RBError as e:
+            if e.line is None:
+                e.line = (self.fno, self.line)
+            if isinstance(e.line, tuple):
+                fno, e.line = e.line
+                if fno:
+                    e.file = self.where(fno)
+            raise
+
+    # ---- .include "file.bas"
+
+    INCLUDE_RE = re.compile(r'^\s*\.include\b(.*)$', re.I)
+
+    @staticmethod
+    def _file_key(path):
+        return os.path.normcase(os.path.realpath(path))
+
+    def expand(self, src, fno, chain):
+        """Source lines as (file index, line number, text, is_include), included files spliced in."""
+        out = []
+        for n, raw in enumerate(src.splitlines(), 1):
+            m = self.INCLUDE_RE.match(raw)
+            if not m:
+                out.append((fno, n, raw, False))
+                continue
+            arg = strip_comment(m.group(1)).strip()
+            fm = re.match(r'^"([^"]+)"$', arg)
+            if not fm:
+                raise RBError('.include needs a file name in quotes: .include "file.bas"', (fno, n))
+            path = self.find_include(fm.group(1), self.files[fno]['dir'])
+            if path is None:
+                raise RBError("include file '%s' not found" % fm.group(1), (fno, n))
+            key = self._file_key(path)
+            if key in chain:
+                raise RBError("circular .include of '%s'" % fm.group(1), (fno, n))
+            out.append((fno, n, raw, True))
+            if key in self.once:            # each file is included only once
+                continue
+            self.once.add(key)
             try:
-                self.process(raw)
-            except RBError as e:
-                if e.line is None:
-                    e.line = n
-                raise
-        self.line = len(lines)
-        self.finish()
+                with open(path, encoding='utf-8-sig') as f:
+                    text = f.read()
+            except OSError as e:
+                raise RBError("cannot read include file '%s': %s" % (fm.group(1), e.strerror), (fno, n))
+            full = os.path.abspath(path)
+            try:
+                name = os.path.relpath(full, self.files[0]['dir'])
+            except ValueError:              # on another drive
+                name = full
+            self.files.append({'name': name.replace(os.sep, '/'), 'path': full,
+                               'dir': os.path.dirname(full)})
+            out += self.expand(text, len(self.files) - 1, chain + [key])
+        return out
+
+    def find_include(self, name, here):
+        if os.path.isabs(name):
+            return name if os.path.isfile(name) else None
+        for d in [here] + list(self.include_dirs):
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def src_tag(self):
+        """Line prefix for listing comments: '0012  ', or 'uart.bas:0012  ' in an included file."""
+        if self.fno:
+            return '%s:%04d  ' % (self.files[self.fno]['name'], self.line)
+        return '%04d  ' % self.line
+
+    def where(self, fno):
+        """File name for messages: included files relative to the current directory."""
+        f = self.files[fno]
+        if not fno or not f['path']:
+            return f['name']
+        try:
+            rel = os.path.relpath(f['path'])
+        except ValueError:                  # on another drive
+            return f['path']
+        return f['path'] if rel.startswith('..') else rel.replace(os.sep, '/')
 
     def warn(self, msg):
-        self.warnings.append('%s:%d: warning: %s' % (self.fname, self.line, msg))
+        name = self.where(self.fno) if self.files else self.fname
+        self.warnings.append('%s:%d: warning: %s' % (name, self.line, msg))
 
     def prescan(self, lines):
         sig_re = re.compile(r'^\s*(SUB|FUNCTION)\s+([A-Za-z_]\w*)\s*(?:\(([^)]*)\))?\s*'
                             r'(?:AS\s+([A-Za-z]+)(?:\s*\*\s*(\w+))?)?\s*(?::.*)?$', re.I)
-        for n, raw in enumerate(lines, 1):
+        for fno, ln, raw, inc in lines:
+            n = (fno, ln)
+            if inc:
+                continue
             s = strip_comment(raw)
             if re.match(r'^\s*ON\s+IRQ\b', s, re.I):
                 self.has_irq = True
@@ -1858,7 +1959,7 @@ class Compiler:
 
     def process(self, raw):
         if self.in_asm:
-            self.em.comment('%04d  %s' % (self.line, raw.rstrip()))
+            self.em.comment(self.src_tag() + raw.rstrip())
             if re.match(r'^\s*END\s+ASM\b', raw, re.I):
                 self.in_asm = False
                 return
@@ -1869,7 +1970,7 @@ class Compiler:
         if toks and self.in_device is None and not (toks[0].kind == 'id' and toks[0].up in DECLARATIONS | {'REM'}):
             self.ensure_start()
         if raw.strip():
-            self.em.comment('%04d  %s' % (self.line, raw.strip()))
+            self.em.comment(self.src_tag() + raw.strip())
         if not toks or (toks[0].kind == 'id' and toks[0].up == 'REM'):
             return
         if self.in_device is not None:
@@ -4643,22 +4744,24 @@ class Compiler:
         return syms
 
     def line_rows(self):
-        """(address, source line) wherever the source line changes; 0 = no source line."""
+        """(address, file index, source line) wherever the source position changes.
+        Line 0 (in file 0) marks code without a source line: startup, runtime, data."""
         em = self.em
         rows, prev = [], None
         for i, (k, size) in enumerate(zip(em.kind, em.isz)):
             if size == 0:
                 continue
-            line = 0 if k == 'data' else em.iline[i]
-            if line != prev:
-                rows.append((em.addr[i], line))
-                prev = line
+            pos = (0, 0) if k == 'data' or not em.iline[i] else em.iline[i]
+            if pos != prev:
+                rows.append((em.addr[i],) + pos)
+                prev = pos
         return rows
 
     def elf(self, debug=True):
         bss = (self.ram_base, self.ram_used) if self.ram_base is not None and self.ram_used else None
         extra = dwarf_sections(self.fname, self.src_dir, self.em.base, self.em.end, self.line_rows(),
-                               'RiscBasic %s' % VERSION) if debug else ()
+                               'RiscBasic %s' % VERSION,
+                               [f['name'] for f in self.files[1:]]) if debug else ()
         return elf32(self.binary(), self.em.base, self.ext, self.elf_symbols(), bss, self.em.base, extra)
 
 
@@ -4734,11 +4837,13 @@ def sleb(v):
             return bytes(out)
 
 
-def dwarf_sections(name, comp_dir, low, high, rows, producer):
+def dwarf_sections(name, comp_dir, low, high, rows, producer, includes=()):
     """DWARF 3 debug sections for one compile unit: line table plus the unit that points to it.
 
-    rows: (address, line) in address order; line 0 marks code without a source line
-    (startup, runtime routines, data).
+    rows:     (address, file index, line) in address order; file 0 is the main source,
+              file k is includes[k-1]; line 0 marks code without a source line
+              (startup, runtime routines, data).
+    includes: names of included files, relative to comp_dir (or absolute)
     """
     import struct
     abbrev = (uleb(1) + uleb(0x11) + b'\0' +                 # DW_TAG_compile_unit, no children
@@ -4758,11 +4863,15 @@ def dwarf_sections(name, comp_dir, low, high, rows, producer):
 
     hdr = (bytes([1, 1, (-5) & 0xFF, 14, 13]) +              # min inst length, is_stmt, line_base, line_range, opcode_base
            bytes([0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1]) +       # standard opcode lengths
-           b'\0' +                                            # no include directories: file is in comp_dir
-           name.encode() + b'\0' + uleb(0) + uleb(0) + uleb(0) + b'\0')
+           b'\0' +                                            # no include directories: names are relative to comp_dir
+           b''.join(f.encode() + b'\0' + uleb(0) + uleb(0) + uleb(0) for f in [name] + list(includes)) +
+           b'\0')
     prog = b'\0' + uleb(5) + b'\x02' + struct.pack('<I', rows[0][0] if rows else low)   # DW_LNE_set_address
-    addr, line = (rows[0][0] if rows else low), 1
-    for a, ln in rows:
+    addr, fno, line = (rows[0][0] if rows else low), 0, 1
+    for a, fn, ln in rows:
+        if fn != fno:
+            prog += b'\x04' + uleb(fn + 1)                   # DW_LNS_set_file (DWARF files count from 1)
+            fno = fn
         if a != addr:
             prog += b'\x02' + uleb(a - addr)                  # DW_LNS_advance_pc
             addr = a
@@ -4887,11 +4996,13 @@ def intel_hex(data, base):
     return '\n'.join(out) + '\n'
 
 
-def compile_file(path, outbase=None, lst=True, elf=True, debug=True):
+def compile_file(path, outbase=None, lst=True, elf=True, debug=True, include_dirs=()):
     with open(path, encoding='utf-8-sig') as f:    # accepts files with or without a BOM
         src = f.read()
     c = Compiler(os.path.basename(path))
     c.src_dir = os.path.dirname(os.path.abspath(path))
+    c.src_path = os.path.abspath(path)
+    c.include_dirs = list(include_dirs)
     c.compile(src)
     outbase = outbase or os.path.splitext(path)[0]
     data = c.binary()
@@ -4918,11 +5029,14 @@ def main(argv=None):
     ap.add_argument('--no-lst', action='store_true', help='do not write the .lst listing')
     ap.add_argument('--no-elf', action='store_true', help='do not write the .elf file')
     ap.add_argument('--no-debug', action='store_true', help='no DWARF line information in the .elf')
+    ap.add_argument('-I', dest='include', action='append', default=[], metavar='DIR',
+                    help="search DIR for .include files (after the including file's directory)")
     a = ap.parse_args(argv)
     try:
-        c = compile_file(a.source, a.output, not a.no_lst, not a.no_elf, not a.no_debug)
+        c = compile_file(a.source, a.output, not a.no_lst, not a.no_elf, not a.no_debug, a.include)
     except RBError as e:
-        print('%s:%s: error: %s' % (a.source, e.line if e.line is not None else '?', e.msg), file=sys.stderr)
+        print('%s:%s: error: %s' % (e.file or a.source, e.line if e.line is not None else '?', e.msg),
+              file=sys.stderr)
         return 1
     except OSError as e:
         print('error: %s' % e, file=sys.stderr)
