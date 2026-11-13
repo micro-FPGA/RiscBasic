@@ -1168,6 +1168,50 @@ B('Form: `LINE INPUT [dev,] ["prompt",] buffer [, length]`. `buffer` is a `BYTE`
   'Enter (CR) ends the line and is not stored. LF is ignored, so terminals that send CR LF work.',
   'Backspace (8) and DEL (127) remove the last character and erase it on the terminal. Other control '
   'characters are ignored. When the buffer is full, further characters are ignored until Enter.')
+H2('READ and WRITE')
+P('`READ` and `WRITE` send or receive a list of values through routines the program defines. The name '
+  'before the first comma selects them: `WRITE dev, ...` calls `SUB devWrite`, `READ dev, ...` calls '
+  '`FUNCTION devRead`.')
+CODE('''SUB SpiWrite(v AS BYTE)          ' one value out
+  WAIT UNTIL SPI.TXREADY
+  SPI.DATA = v
+END SUB
+
+FUNCTION SpiRead AS BYTE         ' one value in
+  WAIT UNTIL SPI.RXREADY
+  RETURN SPI.DATA
+END FUNCTION
+
+WRITE Spi, &H03, addr SHR 8, addr      ' three calls of SpiWrite
+READ Spi, id, buf(0), buf(1)           ' three calls of SpiRead''')
+B('Form: `WRITE dev, item, ...` and `READ dev, target, ...`, with at least one item. `dev` is only a '
+  'name: it may be a declared `DEVICE`, but does not have to be. Case does not matter.',
+  '`WRITE` needs `SUB devWrite` with exactly one parameter (a `FUNCTION` also works; its result is '
+  'ignored). Items are expressions, or string arguments when the parameter is a `STRING`.',
+  '`READ` needs `FUNCTION devRead` without parameters, returning a number. Each target receives the '
+  'result of one call, as in an assignment: variables, registers, array elements, device registers, '
+  'bits and fields.',
+  'Items are handled left to right, one call each: `WRITE Spi, a, b` is `SpiWrite a : SpiWrite b`.',
+  'A missing or unsuitable routine is a compile error that names the routine expected.')
+P('An item can also name a procedure of the device: a lone name `X` for which `SUB devX` exists calls '
+  'that SUB, without a value, at its place in the list.')
+CODE('''SUB SpiStart                     ' chip select active
+  SPI.CS = 1
+END SUB
+
+SUB SpiStop                      ' chip select inactive
+  SPI.CS = 0
+END SUB
+
+WRITE Spi, Start, &H03, addr SHR 8, addr     ' SpiStart, then three SpiWrite calls
+READ Spi, id, buf(0), Stop                   ' three SpiRead calls, then SpiStop
+WRITE Spi, Start, &H06, Stop                 ' SpiStart : SpiWrite &H06 : SpiStop''')
+B('A procedure item is a single name followed by `,` or the end of the statement, with a `SUB devName` '
+  'that has no parameters (a `FUNCTION` without parameters also works; its result is ignored).',
+  'If the name is also a variable, constant, alias, device, register or routine, the item is ambiguous: '
+  'a compile error asks to rename one.',
+  '`devWrite` / `devRead` is needed only when the statement also has value items: `WRITE Spi, Start` '
+  'alone is allowed.')
 
 # ---- 16 Inline assembly
 H1('Inline assembly')
@@ -1317,6 +1361,7 @@ KW = [
     ['`MOD`', 'Operator', 'Remainder', '9.3'],
     ['`ON IRQ` ... `END IRQ`', 'Declaration', 'Interrupt handler', '13.3'],
     ['`PRINT`', 'Statement', 'Output to a device', '15.2'],
+    ['`READ`', 'Statement', 'Values from FUNCTION devRead into targets', '15.5'],
     ['`READONLY` `WRITEONLY`', 'Device', 'Register access restrictions', '7.1'],
     ['`REG` ... `AT`', 'Device', 'Device register', '7.1'],
     ['`REM`', 'Comment', 'Comment to the end of the line', '3.2'],
@@ -1330,12 +1375,13 @@ KW = [
     ['`TARGET`', 'Declaration', 'Instruction set', '4.1'],
     ['`WAIT UNTIL`', 'Statement', 'Poll until a condition is true', '14'],
     ['`WHILE` ... `WEND`', 'Statement', 'Loop, tested at the start', '12.2'],
+    ['`WRITE`', 'Statement', 'Values to SUB devWrite, one call each', '15.5'],
 ]
 T(['Keyword', 'Kind', 'Purpose', 'Section'], KW, [5.6, 3.0, 6.0, 1.8], size=8.5)
 
 # ---- Appendix B: reserved words
 APPENDIX('B', 'Reserved words')
-P('These words cannot be used as names of variables, constants, aliases, labels, SUBs or FUNCTIONs:')
+P('These words cannot be used as names of variables, constants, aliases, labels or parameters:')
 words = sorted(riscbasic.KEYWORDS)
 p = doc.add_paragraph()
 runs(p, ', '.join('`%s`' % w for w in words))

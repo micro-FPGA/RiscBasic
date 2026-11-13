@@ -1151,6 +1151,84 @@ PRINT UART0, " ", DEC R10, " ", HEX R11, 13, 10
 ''', 'right 1 FFFFFFFE\r\n')
 
 
+test('last argument without the stack', '''
+DIM a AS WORD IN A0
+DIM b AS WORD IN A1
+DIM w AS WORD
+SUB Show(x AS WORD, y AS WORD, z AS WORD)
+  PRINT UART0, DEC x, " ", DEC y, " ", DEC z, " "
+END SUB
+SUB Two(s AS STRING, n AS WORD)
+  PRINT UART0, s, DEC n, " "
+END SUB
+a = 1 : b = 2 : w = 3
+Show b, a, b + a
+Show a + 10, 5, b
+Show w, b, a
+Two "n=", a + b
+Show 7, 8, w * 2
+PRINT UART0, DEC a, DEC b, 13, 10
+''', '2 1 3 11 5 2 3 2 1 n=3 7 8 6 12\r\n')
+
+test('READ and WRITE', '''
+DIM a AS WORD, b AS SBYTE, n AS WORD
+DIM e(3) AS BYTE
+DIM r AS WORD IN A1
+FUNCTION FifoRead AS WORD
+  n = n + 1
+  RETURN n * 10
+END FUNCTION
+FUNCTION NegRead AS SBYTE
+  RETURN -3
+END FUNCTION
+SUB LogWrite(v AS SWORD)
+  PRINT UART0, DEC v, " "
+END SUB
+SUB TxtWrite(s AS STRING)
+  PRINT UART0, s, "|"
+END SUB
+SUB PlainWrite(v AS WORD)
+  PLAIN.WIDE = PLAIN.WIDE + v
+END SUB
+r = 5
+READ Fifo, a, e(2), PLAIN.MODE, e(1).3, r
+READ Neg, b
+WRITE Log, a, e(2), e(1), PLAIN.CTRL, r, a + r * 2, 7, b
+WRITE Txt, "hi", "yo"
+WRITE Plain, 1, 2, 3
+PRINT UART0, DEC PLAIN.WIDE, 13, 10
+''', '10 20 8 96 50 110 7 -3 hi|yo|6\r\n')
+
+test('READ and WRITE procedures', '''
+DIM a AS WORD, n AS WORD
+FUNCTION LcdRead AS WORD
+  n = n + 1
+  RETURN n
+END FUNCTION
+SUB LcdWrite(v AS WORD)
+  PRINT UART0, DEC v, " "
+END SUB
+SUB LcdStart
+  PRINT UART0, "<"
+END SUB
+SUB LcdStop
+  PRINT UART0, "> "
+END SUB
+SUB BusStart
+  PRINT UART0, "S"
+END SUB
+SUB BusStop
+  PRINT UART0, "P "
+END SUB
+WRITE Lcd, Start, 25, 20, Stop
+READ Lcd, Start, a, Stop
+PRINT UART0, DEC a, " "
+WRITE Bus, Start, Stop
+READ Bus, Start
+PRINT UART0, 13, 10
+''', '<25 20 > <> 1 SP S\r\n')
+
+
 def make_compiler(name, body):
     c = Compiler(name)
     if '.include' in body.lower():
@@ -1159,6 +1237,21 @@ def make_compiler(name, body):
 
 
 ERRORS = [
+    ('SUB S(val AS BYTE)' + chr(10) + 'END SUB', "parameter 'val' of S: 'VAL' is reserved"),
+    ('SUB S(a0)' + chr(10) + 'END SUB', "'A0' is reserved"),
+    ('WRITE Nope, 1', 'needs SUB NopeWrite'),
+    ('SUB TwoWrite(a, b)' + chr(10) + 'END SUB' + chr(10) + 'WRITE Two, 1', 'needs SUB TwoWrite'),
+    ('SUB XRead' + chr(10) + 'END SUB' + chr(10) + 'READ X, R10', 'needs FUNCTION XRead()'),
+    ('FUNCTION XRead(a) AS WORD' + chr(10) + 'RETURN a' + chr(10) + 'END FUNCTION' + chr(10) + 'READ X, R10',
+     'needs FUNCTION XRead()'),
+    ('FUNCTION XRead AS WORD' + chr(10) + 'RETURN 1' + chr(10) + 'END FUNCTION' + chr(10) + 'READ X, 5',
+     'name expected'),
+    ('SUB LWrite(v)' + chr(10) + 'END SUB' + chr(10) + 'WRITE L', "',' expected"),
+    ('DIM Stop AS WORD' + chr(10) + 'SUB XStop' + chr(10) + 'END SUB' + chr(10) + 'WRITE X, Stop',
+     "'Stop' is both a name and the procedure XStop"),
+    ('SUB XStop(v)' + chr(10) + 'END SUB' + chr(10) + 'READ X, Stop', 'must have no parameters'),
+    ('SUB XStart' + chr(10) + 'END SUB' + chr(10) + 'WRITE X, Start, 5', 'needs SUB XWrite'),
+    ('SUB XStart' + chr(10) + 'END SUB' + chr(10) + 'READ X, Start, R10', 'needs FUNCTION XRead()'),
     ('.include "nope.bas"', 'not found'),
     ('#ENDIF', '#ENDIF without #IF'),
     ('ON IRQ MEXT' + chr(10) + 'END IRQ' + chr(10) + 'DIM x AS WORD IN TP', 'reserved for the interrupt return'),

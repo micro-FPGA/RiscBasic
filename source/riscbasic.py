@@ -6,7 +6,7 @@
 """
 RiscBasic compiler v0.35
 (v0.2: compressed instructions for RV32IC / RV32EC; v0.3: branch shrinking and far branches;
- v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers; v0.14: WRITEONLY registers with shadow; v0.15: REPEAT ... UNTIL; v0.16: CASE ranges; v0.17: CASE IS; v0.18: single-line ELSE binds to the nearest IF; v0.19: ':' separator; v0.20: strings; v0.21: LEN and string comparison; v0.22: LEFT$ RIGHT$ MID$ INSTR; v0.23: VAL; v0.24: .include; v0.25: #IF conditional compilation; v0.26: MEM[addr]; v0.27: SUB BoardInit; v0.28: LUI reuse; v0.29: MEM field writes via a variable address without the stack; v0.30: bit and field assignment to array elements; v0.31: array element fields without the stack; v0.32: MEM field writes with the shift merge; v0.33: constant moved to the right of commutative operators; v0.34: startup disables interrupts; v0.35: interrupt return without mret)
+ v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers; v0.14: WRITEONLY registers with shadow; v0.15: REPEAT ... UNTIL; v0.16: CASE ranges; v0.17: CASE IS; v0.18: single-line ELSE binds to the nearest IF; v0.19: ':' separator; v0.20: strings; v0.21: LEN and string comparison; v0.22: LEFT$ RIGHT$ MID$ INSTR; v0.23: VAL; v0.24: .include; v0.25: #IF conditional compilation; v0.26: MEM[addr]; v0.27: SUB BoardInit; v0.28: LUI reuse; v0.29: MEM field writes via a variable address without the stack; v0.30: bit and field assignment to array elements; v0.31: array element fields without the stack; v0.32: MEM field writes with the shift merge; v0.33: constant moved to the right of commutative operators; v0.34: startup disables interrupts; v0.35: interrupt return without mret; v0.36: READ and WRITE with procedure items, last call argument without the stack)
 
 Compiles RiscBasic (spec: RiscBasic-Spec.md, Draft 0.26) directly to RISC-V
 machine code in a single pass, without a linker.
@@ -26,7 +26,7 @@ import os
 import re
 import sys
 
-VERSION = '0.35'
+VERSION = '0.36'
 HEADER = ('License: MIT', 'Copyright 7AG (2026) MicroFPGA UG(h)', 'https://github.com/micro-FPGA/RiscBasic')
 
 # ---------------------------------------------------------------- registers
@@ -894,7 +894,7 @@ KEYWORDS = DECLARATIONS | {
     'ATOMIC', 'ASM', 'LET', 'AND', 'OR', 'XOR', 'NOT', 'MOD', 'AS', 'IN',
     'AT', 'SIZE', 'REG', 'BIT', 'FIELD', 'READONLY', 'WRITEONLY', 'SETS', 'CLEARS',
     'MEM', 'MEM8', 'MEM16', 'MEM32', 'STRING', 'CHR$', 'DEC$', 'HEX$', 'LEN',
-    'LEFT$', 'RIGHT$', 'MID$', 'INSTR', 'VAL'}
+    'LEFT$', 'RIGHT$', 'MID$', 'INSTR', 'VAL', 'READ', 'WRITE'}
 
 
 class Obj:
@@ -2073,7 +2073,11 @@ class Compiler:
                     typ = (pm.group(2) or 'WORD').upper()
                     if typ not in TYPES and typ != 'STRING':
                         raise RBError("unknown type '%s'" % typ, n)
-                    params.append((pm.group(1).upper(), typ))
+                    pu = pm.group(1).upper()
+                    if pu in KEYWORDS or pu in BASIC_REGS:
+                        raise RBError("parameter '%s' of %s: '%s' is reserved, choose another name"
+                                      % (pm.group(1), m.group(2), pu), n)
+                    params.append((pu, typ))
             rtype = (m.group(4) or 'WORD').upper()
             strsize = None
             if rtype == 'STRING':
@@ -3247,17 +3251,28 @@ class Compiler:
         for r in save:
             self.push(r)
         consts, pushed = {}, []
+        computed = [i for i, a in enumerate(args) if isinstance(a, tuple) or a.k != 'const']
+        last, held = computed[-1] if computed else None, None
         for i, a in enumerate(args):
             if isinstance(a, tuple):
-                self.push(self.str_address(a[1]))
-                pushed.append(i)
+                r = self.str_address(a[1])
             elif a.k == 'const':
                 consts[i] = a.a
+                continue
             else:
-                self.push(self.gen(a, T1))
+                r = self.gen(a, T1)
+            if i == last:                     # nothing is evaluated after it: no stack needed
+                if r in PARAM_REGS and r != PARAM_REGS[i] and len(pushed):
+                    em.mv(T1, r)              # a register variable the pops below would overwrite
+                    r = T1
+                held = (i, r)
+            else:
+                self.push(r)
                 pushed.append(i)
         for i in reversed(pushed):
             self.pop(PARAM_REGS[i])
+        if held:
+            em.mv(PARAM_REGS[held[0]], held[1])
         for i, v in consts.items():
             em.li(PARAM_REGS[i], v)
         em.ins('jal', RA, f['label'])
@@ -4692,6 +4707,76 @@ class Compiler:
         em.ins('jal', RA, '__getline_' + dn)
         if dest is not None:
             self.assign(dest.a, Node('obj', Obj('reg', 'length', reg=T1), width=32))
+
+    def st_write(self):
+        """WRITE dev, item, ...
+
+        Calls SUB devWrite(value) once per item, left to right: WRITE SPI, a, 5 is
+        SPIWrite a : SPIWrite 5. dev is a name only (a DEVICE or not); the SUB does the work.
+        Items are expressions, or string terms when the parameter is a STRING. A lone name X
+        with a SUB devX calls that procedure instead (dev_procedure).
+        """
+        tok = self.expect_id()
+        name = tok.up + 'WRITE'
+        self.expect_op(',')
+        while True:
+            if not self.dev_procedure('WRITE', tok):
+                f = self.funcs.get(name)
+                if f is None or len(f['params']) != 1:
+                    raise RBError("WRITE %s needs SUB %sWrite with one parameter" % (tok.val, tok.val))
+                string = f['params'][0][1] == 'STRING'
+                arg = ('sterm', self.str_term()) if string else self.expr()
+                self.gen_call(name, [arg], False)
+            if not self.accept_op(','):
+                break
+
+    def dev_procedure(self, stmt, dev):
+        """A READ / WRITE item that is a lone name X, where SUB devX exists: call devX, no value.
+        WRITE Lcd, 25, Stop calls LcdWrite 25, then LcdStop."""
+        tok, after = self.peek(), self.peek(1)
+        if tok.kind != 'id' or not (after.kind == 'eol' or (after.kind == 'op' and after.val == ',')):
+            return False
+        pname = dev.up + tok.up
+        f = self.funcs.get(pname)
+        if f is None:
+            return False
+        u = tok.up
+        if (self.scope is not None and u in self.scope) or u in self.vars or u in self.consts or \
+                u in self.devices or u in self.aliases or u in self.funcs or u in BASIC_REGS:
+            raise RBError("%s %s: '%s' is both a name and the procedure %s%s; rename one"
+                          % (stmt, dev.val, tok.val, dev.val, tok.val))
+        if f['params']:
+            raise RBError("%s %s: %s%s is called as a procedure and must have no parameters"
+                          % (stmt, dev.val, dev.val, tok.val))
+        self.i += 1
+        self.gen_call(pname, [], False)
+        return True
+
+    def st_read(self):
+        """READ dev, target, ...
+
+        Stores FUNCTION devRead() into each target, left to right: READ SPI, a, b is
+        a = SPIRead() : b = SPIRead(). Targets: anything that can stand left of '='. A lone
+        name X with a SUB devX calls that procedure instead (dev_procedure).
+        """
+        tok = self.expect_id()
+        name = tok.up + 'READ'
+        self.expect_op(',')
+        while True:
+            if self.dev_procedure('READ', tok):
+                if not self.accept_op(','):
+                    break
+                continue
+            f = self.funcs.get(name)
+            if f is None or f['kind'] != 'FUNCTION' or f['str'] or f['params']:
+                raise RBError("READ %s needs FUNCTION %sRead() with no parameters, returning a number"
+                              % (tok.val, tok.val))
+            dest = self.ref()
+            if dest.k != 'obj':
+                raise RBError('READ needs a variable, register or device register to store into')
+            self.assign(dest.a, Node('call', (name, []), signed=f['signed'], width=f['width']))
+            if not self.accept_op(','):
+                break
 
     def st_console(self):
         """CONSOLE dev: PRINT statements after this line send to dev unless they name a device."""

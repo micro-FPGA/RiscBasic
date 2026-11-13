@@ -1,6 +1,6 @@
 # RiscBasic — Language Specification
 
-**Draft 0.28** — 12 November 2026 (7 AG)
+**Draft 0.29** — 13 November 2026 (7 AG)
 Language design: Antti Lukats (Identor #1). Drafting: Claude (Identor #9).
 
 ---
@@ -479,6 +479,48 @@ PRINT "Hello, ", name, 13, 10    ' print it back (section 9)
 - Other control characters (below 32) are ignored. Characters 32–255 are stored and echoed. When the buffer is full, further characters are ignored until Enter.
 - `length`, if given, receives the number of characters stored. Any assignable target works.
 
+### 9.3 READ and WRITE
+
+Send or receive a list of values through routines the program defines. The name before the first comma selects them: `WRITE dev, ...` calls `SUB devWrite`, `READ dev, ...` calls `FUNCTION devRead`.
+
+```basic
+SUB SpiWrite(v AS BYTE)          ' one value out
+  WAIT UNTIL SPI.TXREADY
+  SPI.DATA = v
+END SUB
+
+FUNCTION SpiRead AS BYTE         ' one value in
+  WAIT UNTIL SPI.RXREADY
+  RETURN SPI.DATA
+END FUNCTION
+
+WRITE Spi, &H03, addr SHR 8, addr      ' SpiWrite &H03 : SpiWrite addr SHR 8 : SpiWrite addr
+READ Spi, id, buf(0), buf(1)           ' id = SpiRead() : buf(0) = SpiRead() : buf(1) = SpiRead()
+```
+
+An item can also name a procedure of the device: a lone name `X` for which `SUB devX` exists calls that SUB, without a value, at its place in the list.
+
+```basic
+SUB SpiStart                     ' chip select active
+  SPI.CS = 1
+END SUB
+
+SUB SpiStop                      ' chip select inactive
+  SPI.CS = 0
+END SUB
+
+WRITE Spi, Start, &H03, addr SHR 8, addr     ' SpiStart, then three SpiWrite calls
+READ Spi, id, buf(0), Stop                   ' three SpiRead calls, then SpiStop
+WRITE Spi, Start, &H06, Stop                 ' SpiStart : SpiWrite &H06 : SpiStop
+```
+
+- Form: `WRITE dev, item, ...` and `READ dev, target, ...`, with at least one item. `dev` is only a name: it may be a declared `DEVICE`, but does not have to be. The routine's name is `dev` followed by `Write`, `Read` or the procedure name (case does not matter).
+- `WRITE` needs a `SUB` with exactly one parameter (a `FUNCTION` also works; its result is ignored). Items are expressions; when the parameter is a `STRING`, the items are string arguments as in a call.
+- `READ` needs a `FUNCTION` without parameters that returns a number. Each target receives the result of one call, as in an assignment. Any assignable target works: variables, registers, array elements, device registers, bits and fields.
+- **Procedure items.** An item that is a single name, followed by `,` or the end of the statement, is a procedure call when `SUB devName` exists. The SUB must have no parameters (a `FUNCTION` without parameters also works; its result is ignored). If the name is also a variable, constant, alias, device, register or routine, the item is ambiguous and a compile error. `devWrite` / `devRead` is needed only if the statement also has value items, so `WRITE Spi, Start` alone is allowed.
+- Items are handled left to right, one call each. The statement compiles to exactly that sequence of calls.
+- A missing or unsuitable routine is a compile error that names the routine expected.
+
 ## 10. Inline assembly
 
 ```basic
@@ -608,7 +650,8 @@ LOOP
 | 36 | Board initialization | a `SUB BoardInit` (no parameters) is called by the startup code before `main` | 0.26 |
 | 37 | Array element bits and fields | `buf(i).n` and `buf(i)[hi:lo]` can be assigned (read-modify-write), with constant or computed index | 0.27 |
 | 38 | Interrupt return | No `mret`: restore registers, return address in `TP`, set `MIE`, `jr tp`; `TP` reserved with `ON IRQ` | 0.28 |
+| 39 | READ and WRITE | `WRITE dev, items` calls `SUB devWrite(item)` once per item; `READ dev, targets` assigns `FUNCTION devRead()` to each target; a lone name `X` with `SUB devX` calls that procedure | 0.29 |
 
 ## 14. Open questions
 
-None at Draft 0.28.
+None at Draft 0.29.
