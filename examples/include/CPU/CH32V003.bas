@@ -1,6 +1,8 @@
 ' 
 ' CH32V003
 '
+' NOT READY, only basic settings are done
+' 
 
 TARGET RV32EC
 CLOCK  48_000_000

@@ -1,5 +1,7 @@
 ' RiscBasic example
-
+'
+' NOTE will not work on CH32V003 the libs are not ready!!!
+'
 .include "include/CPU/CH32V003.bas"
 .include "include/boards/CH32V003_EVAL.bas"
 .include "lib/uart.bas"
