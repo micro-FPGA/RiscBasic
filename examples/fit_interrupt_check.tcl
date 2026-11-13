@@ -7,11 +7,16 @@
 #
 #   connect
 #   targets                      ;# select the MicroBlaze V hart: targets <n>
-#   rst -system                  ;# CPU and IO Module: also resets the INTC handshake state
-#   dow fit_interrupt.elf
-#   con                          ;# the program must be running
 #   source fit_interrupt_check.tcl
+#   fit_run fit_interrupt.elf    ;# reset, download, start (see below)
 #   fit_check fit_interrupt.lst  ;# the listing of the same build (label and variable addresses)
+#
+# Seen on the MicroBlaze V MCS with XSDB 2025.2: after a single step (stpi, nxt, or the step
+# the debugger makes to resume from a breakpoint that is still set, such as a breakpoint at
+# main) the core takes no interrupts until the next plain halt and resume (stop, con). A
+# program that runs without the debugger is not affected. fit_run therefore ends with one
+# plain stop and con. Also reset before every download (rst -system): after dow alone the
+# CSRs and the IO Module keep the old program's state, including its interrupt vectors.
 #
 # The check stops and continues the CPU, acknowledges FIT1 once from the debugger, and sets
 # and removes one software breakpoint. Nothing else is changed.
@@ -208,11 +213,34 @@ proc fit_trace {lst {n 150}} {
     puts "mcause [fc_opt [fc_csr mcause]]  mepc [fc_opt [fc_csr mepc]]  mstatus [fc_opt [fc_csr mstatus]]  mip [fc_opt [fc_csr mip]]"
 }
 
+# Reset the MCS (CPU and IO Module), download, start; continue past breakpoints, then one
+# plain stop + con, which re-enables interrupts after any single step.
+proc fit_run {elf} {
+    catch {stop}
+    catch {rst -system}
+    after 300
+    catch {rst -processor}
+    after 200
+    catch {stop}
+    dow $elf
+    for {set k 0} {$k < 4} {incr k} {
+        con
+        after 300
+        if {![string match -nocase "*Stopped*" [state]]} break
+        puts "stopped at [rrd pc], continuing"
+    }
+    catch {stop}
+    after 20
+    con
+    puts "running: $elf"
+}
+
 proc fc_opt {v} {
     if {$v eq ""} { return "?" }
     return [fc_hex $v]
 }
 
-puts "fit_check loaded. Now run:  fit_check fit_interrupt.lst   (the listing of the loaded build)"
+puts "fit_check loaded. Start:    fit_run fit_interrupt.elf     (reset, download, start)"
+puts "                  Check:    fit_check fit_interrupt.lst   (the listing of the loaded build)"
 puts "                        or:  fit_status                    (live counters, run it twice)"
 puts "                        or:  fit_trace fit_interrupt.lst   (single-step one interrupt)"

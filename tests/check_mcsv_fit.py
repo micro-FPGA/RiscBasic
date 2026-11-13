@@ -9,7 +9,7 @@ Run examples/fit_interrupt.bas on a model of the MicroBlaze V MCS IO Module.
 The model has the UART TX, GPO1, GPI1, FIT1 and the interrupt controller: latched IRQ_STATUS,
 IRQ_PENDING = STATUS AND ENABLE, write-only IRQ_ENABLE / IRQ_MODE / IRQ_ACK (reads give
 garbage) and the vector table. The interrupt line is level-sensitive, as in the MCS-V, and is
-taken only with mie.MEIE set and mstatus.MIE on for at least LATENCY instructions, and raised again only after the CPU has
+taken only with mstatus.MIE and mie.MEIE set, and raised again only after the CPU has
 set mstatus.MIE again after the previous one (IO Module handshake). As on the board, mret and
 ecall do nothing: the program must return from interrupts without them. The core then jumps to the vector address the
 IO Module supplies (MicroBlaze V low-latency mode, as seen on hardware); it must be __trap.
@@ -38,8 +38,6 @@ IOM = 0x80000000
 GARBAGE = 0xBADC0DE5
 FIT_STEPS = 250                       # instructions between FIT1 strobes
 FIT_PHASE = 20                        # the first strobe: during the startup code
-LATENCY = 10                          # MIE must be on this many instructions before an interrupt
-                                      # is taken (model assumption: the core needs a few cycles)
 STEPS = 60_000
 PRESS, RELEASE = 20_000, 40_000       # button (active low) pressed and released
 
@@ -58,7 +56,6 @@ class MCSV(Sim):
         self.gpo_log, self.wo_reads, self.uart = [], [], []
         self.taken = self.since_init = self.mrets = self.returns = 0
         self.handling = False
-        self.mie_run = 0
 
     def load(self, addr, size, signed):
         a = addr & MASK
@@ -98,7 +95,7 @@ class MCSV(Sim):
         # IO Module handshake (Fast_FSM): after the CPU takes an interrupt, INTC_IRQ stays low
         # until the CPU returns from it (mret, second Interrupt_Ack)
         p = self.isr & self.ier
-        if self.handling or not p or self.mie_run < LATENCY or not self.csr[0x304] & 0x800:
+        if self.handling or not p or not self.csr[0x300] & 8 or not self.csr[0x304] & 0x800:
             return
         n = (p & -p).bit_length() - 1     # lowest number = highest priority
         if self.imr >> n & 1:
@@ -115,7 +112,6 @@ class MCSV(Sim):
         self.handling = True
 
     def step(self):
-        self.mie_run = self.mie_run + 1 if self.csr[0x300] & 8 else 0
         w = self.load(self.pc, 4, False)
         if w in (0x30200073, 0x00000073):       # mret, ecall: no-ops on the MicroBlaze V MCS
             self.mrets += w == 0x30200073
