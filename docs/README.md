@@ -4,15 +4,14 @@ A BASIC-like language for RISC-V, compiled directly to machine code: single pass
 
 Language design: Antti Lukats (Identor #1). Compiler: Claude (Identor #9). 10 November 2026 (7 AG).
 
-- `RiscBasic-Spec.md`: the language specification (Draft 0.26)
+- `RiscBasic-Spec.md`: the language specification (Draft 0.28)
 - `riscbasic.py`: the compiler (Python 3, no dependencies)
 - `rbsim.py`: a small RV32I/M/C/Zbb simulator used for testing
 - `mem2elf.py`: converts a `.mem` file into an ELF executable
 - `tests/run_tests.py`: the test suite
 - `tests/check_gnu.py`: cross-check against the GNU RISC-V toolchain (objdump, objcopy, readelf)
-- `examples/example.bas`: the example from spec section 12
-- `examples/include_demo.bas`: uses `.include "lib/uart0.bas"` for the console declarations
-- `examples/conditional.bas`: `#IF` builds for two boards, with and without debug output
+- `docs/RiscBasic-Reference-Manual.docx` / `.pdf`: the reference manual
+- `docs/make_manual.py`: builds the manual (`python docs/make_manual.py --pdf`; needs python-docx, and Word on Windows for the PDF)
 
 ## Usage
 
@@ -99,7 +98,7 @@ Steps over all test programs (RV32IC): branch shrinking saved 3.3%, runtime call
 
 ## Status and differences from the spec
 
-Implemented: everything in Draft 0.26 sections 2–11, including active-low `NOT` bits and fields (3.2.1), except for the points below.
+Implemented: everything in Draft 0.28 sections 2–11, including active-low `NOT` bits and fields (3.2.1), except for the points below.
 
 1. **Compressed instructions**: see above.
 2. **Recursion.** Parameters and `DIM` inside a SUB are not saved across a recursive call (locals are static RAM). Recursion works only if the SUB does not need its parameters after the recursive call.
@@ -119,4 +118,4 @@ Implemented: everything in Draft 0.26 sections 2–11, including active-low `NOT
 - Strings are built with a small state block in RAM (`__sbstate`: current position and end). When a string `FUNCTION` is called while another string is being built, the caller saves and restores that state around the call. Overlapping assignments build in a scratch buffer: `__strtmp` for the main program and `__tmp_NAME` for each string FUNCTION, each sized to the largest target it needs.
 - RAM variables are addressed relative to `GP = RAM base + 2048`, so the first 4 KB of RAM are one instruction away.
 - `DEC` uses a power-of-ten table, so it needs no multiply or divide.
-- Interrupts: one dispatcher at `mtvec` saves the caller-saved registers, reads `mcause` and calls the matching `ON IRQ` block.
+- Interrupts: one dispatcher at `mtvec` saves the caller-saved registers, reads `mcause` and calls the matching `ON IRQ` block. It returns without `mret` (return address in `TP`, set `MIE`, `jr tp`), because some cores, such as the MicroBlaze V MCS, execute `mret` as a no-op; `TP` is reserved in programs with `ON IRQ`.

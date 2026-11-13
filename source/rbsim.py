@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# License: MIT
+# Copyright 7AG (2026) MicroFPGA UG(h)
+# https://github.com/micro-FPGA/RiscBasic
+
 """
 rbsim: minimal RV32I(M, C, Zbb rol/ror/rori) simulator for testing RiscBasic output.
 

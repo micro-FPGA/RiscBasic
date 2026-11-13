@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# License: MIT
+# Copyright 7AG (2026) MicroFPGA UG(h)
+# https://github.com/micro-FPGA/RiscBasic
+
 """RiscBasic test suite: compile each program, run it in rbsim, check the UART output."""
 
 import os
@@ -7,7 +11,10 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 INC = os.path.join(HERE, 'inc')      # .include fixtures: programs that include files compile from here
-sys.path.insert(0, os.path.dirname(HERE))
+ROOT = os.path.dirname(HERE)
+# the compiler and simulator: in source/ (GitHub layout) or next to tests/
+SRC = os.path.join(ROOT, 'source') if os.path.isfile(os.path.join(ROOT, 'source', 'riscbasic.py')) else ROOT
+sys.path.insert(0, SRC)
 
 from riscbasic import Compiler, RBError   # noqa: E402
 from rbsim import Sim                     # noqa: E402
@@ -813,6 +820,7 @@ PRINT UART0, HEX MEM[&H8000_0008], 13, 10
 test('MEM[addr] fields with computed addresses', '''
 DIM p AS WORD IN R13
 DIM v AS WORD
+DIM q AS WORD
 p = &H8200
 MEM[p] = 0
 MEM[p + 4] = &HFFFFFFFF
@@ -821,9 +829,112 @@ MEM[p][23:4] = v                            ' wide field: the mask needs a regis
 MEM8[p + 3].7 = 1
 MEM[p + 4][11:8] = v + 1                    ' computed value and address
 MEM16[p + 6][3:0] = 0
+q = &H8208                                  ' address in a RAM variable
+MEM[q] = &HFFFFFFFF
+MEM[q][27:4] = v + 1                        ' wide mask: merged with shifts
+MEM[q].0 = v AND 2                          ' computed bit value (0)
 IF MEM[p].31 AND NOT MEM[p].0 THEN PRINT UART0, "bits "
-PRINT UART0, HEX MEM[p], " ", HEX MEM[p + 4], " ", HEX p, 13, 10
-''', 'bits 80123450 FFF0F6FF 00008200\r\n')
+PRINT UART0, HEX MEM[p], " ", HEX MEM[p + 4], " ", HEX p, " ", HEX MEM[q], " ", HEX q, 13, 10
+''', 'bits 80123450 FFF0F6FF 00008200 F012346E 00008208\r\n')
+
+test('SUB BoardInit runs before main', '''
+DIM n AS WORD
+PRINT UART0, "main ", DEC n, 13, 10
+END
+SUB BoardInit                               ' defined after the program, still runs first
+  n = n + 41
+  GPIO.OUT = 5
+  PRINT UART0, "init "
+END SUB
+''', 'init main 41\r\n')
+
+test('LUI reuse for back-to-back accesses', '''
+DIM a AS WORD
+DIM b AS WORD
+DIM i AS WORD
+MEM[&H8000_0000] = 1                        ' one LUI for these three
+MEM[&H8000_0004] = 2
+MEM[&H8000_0008] = MEM[&H8000_0000] + MEM[&H8000_0004]
+a = 7 : b = 9
+MEM[&H8000_000C] = a * b + (a XOR &H7FFF_F123)    ' temporaries may take a5 between accesses
+MEM[&H8000_0010] = MEM[&H8000_000C]
+b = &H8000_0030
+MEM[b][7:4] = a                              ' the old word is loaded into a5 (not by LUI)
+MEM[&H8000_0034] = MEM[b]
+Other
+MEM[&H8000_0014] = 5                        ' after a call a5 is unknown
+IF a = 7 THEN MEM[&H7FFF_F100] = 3 ELSE MEM[&H8000_0018] = 4
+MEM[&H8000_001C] = 6                        ' after IF: paths join at a label
+FOR i = 1 TO 3
+  MEM[&H8000_0020] = MEM[&H8000_0020] + i
+  MEM[&H7FFF_F104] = i                      ' other LUI inside the loop body
+NEXT
+PRINT UART0, DEC MEM[&H8000_0008], " ", DEC MEM[&H8000_0010], " ", DEC MEM[&H8000_0014], " "
+PRINT UART0, DEC MEM[&H7FFF_F100], " ", DEC MEM[&H8000_001C], " ", DEC MEM[&H8000_0020], " ", DEC MEM[&H7FFF_F104], " ", HEX MEM[&H8000_0034], 13, 10
+END
+SUB Other
+  MEM[&H7FFF_F108] = 1
+END SUB
+''', '3 2147479907 5 3 6 6 3 00000070\r\n')
+
+test('bit and field assignment to array elements', '''
+DIM b(4) AS BYTE
+DIM h(4) AS HALF
+DIM w(4) AS WORD
+DIM i AS WORD IN R13
+DIM v AS WORD
+v = 5
+b(1) = &HFF
+b(1)[7:4] = 3                               ' constant index and value
+b(2).0 = 1
+i = 3
+b(i).7 = 1                                  ' computed index, constant value
+h(i)[11:4] = v + 250                        ' computed index and value: the value waits on the stack
+w(0) = &HFFFFFFFF
+w(0)[27:4] = v                              ' constant index, computed value, wide mask
+w(i - 1).31 = v AND 1
+PRINT UART0, HEX b(1), " ", HEX b(2), " ", HEX b(3), " ", HEX h(3), " ", HEX w(0), " ", HEX w(2), " ", DEC i, " ", DEC v, 13, 10
+''', '3F 01 80 0FF0 F000005F 80000000 3 5\r\n')
+
+test('array element fields without the stack', '''
+DIM a(4) AS WORD
+DIM k AS WORD
+DIM i AS WORD
+DIM v AS WORD
+v = &H12345678
+k = 0 : i = 2
+a(0) = &HFFFFFFFF : a(1) = &HFFFFFFFF : a(2) = &HFFFFFFFF
+a(k + 1)[27:4] = v                          ' computed index, simple value, wide mask: merged with shifts
+a(k)[7:4] = v                               ' simple index, narrow mask: andi / or
+a(i)[31:12] = v                             ' simple index, wide mask at the top
+a(k + 3).19 = v                             ' computed index, single bit above the ANDI range
+PRINT UART0, HEX a(1), " ", HEX a(0), " ", HEX a(2), " ", HEX a(3), 13, 10
+''', 'F345678F FFFFFF8F 45678FFF 00080000\r\n')
+
+test('MEM fields: computed address, simple value', '''
+DIM k AS WORD
+DIM v AS WORD
+k = 1 : v = &H12345678
+MEM[&H8300] = &HFFFFFFFF : MEM[&H8304] = &HFFFFFFFF
+MEM[&H8300 + 4 * k][27:4] = v               ' address first, value in s1, wide mask merged with shifts
+MEM[&H8300 + 4 * k - 4][15:8] = v           ' wide mask, field in the middle
+PRINT UART0, HEX MEM[&H8304], " ", HEX MEM[&H8300], 13, 10
+''', 'F345678F FFFF78FF\r\n')
+
+test('constant on the left of an operator', '''
+DIM s AS SWORD
+DIM u AS WORD
+DIM k AS WORD
+s = -5 : u = &HFFFFFFFF : k = 3
+PRINT UART0, DEC 4 * k, " ", DEC 5 + k, " ", DEC 15 AND u, " ", DEC 8 OR k, " ", DEC 1 XOR k, " "
+PRINT UART0, DEC (3 = k), DEC (3 <> k), DEC (2 < k), DEC (3 < k), DEC (3 <= k), DEC (4 > k), DEC (3 >= k), " "
+PRINT UART0, DEC (-10 < s), DEC (0 < s), DEC (-5 <= s), DEC (-6 >= s), DEC (3 < u), " "
+IF 2 < k THEN PRINT UART0, "a"
+IF 0 > s THEN PRINT UART0, "b"
+IF 10 <= u THEN PRINT UART0, "c"
+IF 4 = k THEN PRINT UART0, "x"
+PRINT UART0, 13, 10
+''', '12 8 15 11 2 1010111 10101 abc\r\n')
 
 test('goto, labels, wait, delay', '''
 R12 = 0
@@ -1050,6 +1161,11 @@ def make_compiler(name, body):
 ERRORS = [
     ('.include "nope.bas"', 'not found'),
     ('#ENDIF', '#ENDIF without #IF'),
+    ('ON IRQ MEXT' + chr(10) + 'END IRQ' + chr(10) + 'DIM x AS WORD IN TP', 'reserved for the interrupt return'),
+    ('ON IRQ MEXT' + chr(10) + 'END IRQ' + chr(10) + 'TP = 1', 'reserved for the interrupt return'),
+    ('DIM e(2) AS BYTE' + chr(10) + 'e(1)[15:8] = 1', 'bit 15 outside 8-bit object'),
+    ('SUB BoardInit(x)' + chr(10) + 'END SUB', 'SUB without parameters'),
+    ('FUNCTION BoardInit' + chr(10) + 'END FUNCTION', 'SUB without parameters'),
     ('MEM[&H8100 = 1', "']' expected"),
     ('MEM(&H8100] = 1', "')' expected"),
     ('DIM mem AS WORD', 'reserved'),
@@ -1185,6 +1301,103 @@ PRINT UART0, "release"
     print('%s open #IF reported at its line: %s' % ('ok  ' if ok else 'FAIL', where))
     failed += not ok
     return failed
+
+
+def check_far_array_fields():
+    """Bit and field assignment to array elements beyond GP's reach: the base address is in A5 (lui)."""
+    body = PRELUDE.format(target='RV32IC').replace('RAM    AT &H8000 SIZE 2K', 'RAM    AT &H8000 SIZE 8K') + """
+DIM pad(4096) AS BYTE
+DIM far(4) AS WORD
+DIM v AS WORD
+DIM i AS WORD
+v = &H12345
+far(0) = &HFFFFFFFF
+far(0)[23:4] = v                ' computed value, wide mask: the base is loaded again
+far(1)[3:0] = v                 ' computed value, narrow mask
+far(2).31 = 1                   ' constant value
+far(3) = &HFFFFFFFF
+i = 3
+far(i)[15:8] = 0                ' computed index
+PRINT UART0, HEX far(0), " ", HEX far(1), " ", HEX far(2), " ", HEX far(3), 13, 10
+"""
+    c = make_compiler('far.bas', body)
+    c.compile(body)
+    s = Sim(c.binary(), c.em.base, c.ram_base, c.ram_size)
+    try:
+        done = s.run()
+        out = s.output()
+    except RuntimeError as e:          # e.g. a store through a clobbered base register
+        done, out = False, 'EXCEPTION: %s' % e
+    lst = c.listing()
+    ok = done and out == 'FF12345F 00000005 80000000 FFFF00FF\r\n' and 'a5, 0x9' in lst
+    print('%s array element fields beyond GP: %r' % ('ok  ' if ok else 'FAIL', out))
+    return 0 if ok else 1
+
+
+def check_constant_left():
+    """A constant on the left of a commutative operator or comparison gives the same code as on
+    the right: 4 * k is one shift, 5 + k one addi, 3 < k the same as k > 3."""
+    pairs = [('4 * k', 'k * 4'), ('5 + k', 'k + 5'), ('15 AND k', 'k AND 15'), ('8 OR k', 'k OR 8'),
+             ('1 XOR k', 'k XOR 1'), ('(3 = k)', '(k = 3)'), ('(3 <> k)', '(k <> 3)'),
+             ('(3 < k)', '(k > 3)'), ('(3 >= k)', '(k <= 3)'), ('2 + 4 * k', '2 + k * 4')]
+
+    def code(target, e):
+        src = PRELUDE.format(target=target) + 'DIM k AS WORD\nDIM x AS WORD\nx = %s\n' % e
+        c = Compiler('t.bas')
+        c.compile(src)
+        lst = c.listing()
+        body = lst[lst.index('x = ' + e):lst.index('end of program')]
+        return [ln[18:].split(';')[0].strip() for ln in body.splitlines()[1:]
+                if len(ln) > 18 and ln[0] in '0123456789ABCDEF']
+    bad = [(t, a) for t in ('RV32I', 'RV32IC+M') for a, b in pairs if code(t, a) != code(t, b)]
+    print('%s constant on the left gives the same code: %d pairs%s'
+          % ('FAIL' if bad else 'ok  ', 2 * len(pairs), (', differ: %s' % bad) if bad else ''))
+    return 1 if bad else 0
+
+
+def check_trap_window():
+    """The interrupt return (no mret): an interrupt taken just before the final 'jr tp', with
+    MIE already set, must continue at the address in TP. One interrupt comes at a fixed step,
+    the second exactly when the pc reaches __trap_jump."""
+    body = PRELUDE.format(target='RV32IC') + """
+DIM n AS WORD
+DIM i AS WORD IN S4
+DIM k AS WORD
+ON IRQ MEXT
+  n = n + 1
+END IRQ
+ASM
+  li     t0, 0x800
+  csrrs  zero, mie, t0
+  csrrsi zero, mstatus, 8
+END ASM
+FOR i = 1 TO 2000
+  k = k + i
+NEXT
+PRINT UART0, DEC n, " ", DEC k, 13, 10
+"""
+    c = Compiler('w.bas')
+    c.compile(body)
+    jump = c.em.addr_at(c.em.labels['__trap_jump'])
+    s = Sim(c.binary(), c.em.base, c.ram_base, c.ram_size)
+    window = 0
+    try:
+        while s.steps < 400_000:
+            if s.steps == 3000:
+                s.irq_pending.add(11)
+            if s.pc == jump and not window and s.csr[0x300] & 8:
+                s.irq_pending.add(11)             # MIE is set, 'jr tp' not yet executed
+                window = 1
+            s.step()
+        done = False
+    except Exception as e:
+        done = type(e).__name__ == 'Halt'
+        if not done:
+            print('     %s' % e)
+    out = s.output()
+    ok = done and window and out == '2 2001000\r\n'
+    print('%s interrupt taken just before the return jump: %r' % ('ok  ' if ok else 'FAIL', out))
+    return 0 if ok else 1
 
 
 def check_include_positions():
@@ -1327,6 +1540,11 @@ def main():
             else:
                 print('ok   error: %-26s -> %s' % (body, e.msg))
     failed += check_include_positions()
+    failed += check_trap_window()
+    failed += check_constant_left()
+    import check_mcsv_fit                  # MicroBlaze V MCS FIT example on an IO Module model
+    failed += check_mcsv_fit.main()
+    failed += check_far_array_fields()
     failed += check_conditionals()
     print('\n%s' % ('all tests passed' if not failed else '%d test(s) failed' % failed))
     return 1 if failed else 0

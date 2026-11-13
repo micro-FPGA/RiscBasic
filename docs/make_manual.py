@@ -40,14 +40,24 @@ ap.add_argument('--pdf', action='store_true', help='also update the TOC and expo
 ARGS = ap.parse_args()
 ROOT = os.path.abspath(ARGS.root)
 OUT = os.path.abspath(ARGS.output)
-sys.path.insert(0, ROOT)
+
+
+def find(name, subdir):
+    """A file in ROOT/subdir (GitHub layout: source/, docs/) or in ROOT itself."""
+    for d in (os.path.join(ROOT, subdir), ROOT):
+        if os.path.isfile(os.path.join(d, name)):
+            return os.path.join(d, name)
+    raise SystemExit('%s not found in %s or %s' % (name, os.path.join(ROOT, subdir), ROOT))
+
+
+sys.path.insert(0, os.path.dirname(find('riscbasic.py', 'source')))
 import riscbasic  # noqa: E402
 
 ACCENT = RGBColor(0x1F, 0x4E, 0x79)
 GREY = RGBColor(0x59, 0x59, 0x59)
 BODY_FONT, CODE_FONT = 'Calibri', 'Consolas'
 VERSION = riscbasic.VERSION
-with open(os.path.join(ROOT, 'RiscBasic-Spec.md'), encoding='utf-8') as f:
+with open(find('RiscBasic-Spec.md', 'docs'), encoding='utf-8') as f:
     m = re.search(r'\*\*Draft ([0-9.]+)\*\*\s*\S+\s*(.+)', f.read())
 if not m:
     raise SystemExit('RiscBasic-Spec.md: no "**Draft x.y** — date" line found')
@@ -672,8 +682,9 @@ T(['Register', 'Use', 'In user code'], [
     ['`SP` (`R2`)', 'Stack pointer.', 'Writing it gives a warning'],
     ['`RA` (`R1`)', 'Return address; overwritten by calls, `PRINT` and runtime routines.', 'Warning if the program also makes calls'],
     ['`R0` (`ZERO`)', 'Always 0.', 'Read-only'],
+    ['`TP` (`R4`)', 'Return address of the interrupt return (section 13.3).', 'Error in programs with `ON IRQ`'],
 ], [4.6, 7.6, 4.2])
-P('`T0`–`T2`, `A0`–`A4`, `A6`, `A7`, `S2`–`S11`, `T3`–`T6` and `TP` are free for user variables. On '
+P('`T0`–`T2`, `A0`–`A4`, `A6`, `A7`, `S2`–`S11`, `T3`–`T6`, and `TP` in programs without `ON IRQ`, are free for user variables. On '
   '`RV32E` targets only `R0`–`R15` exist.')
 H2('Variables: DIM')
 CODE('''DIM count AS WORD IN R10    ' pinned to a register
@@ -1077,6 +1088,9 @@ B('`ON IRQ n` takes an interrupt number (0–2047) or one of the names `MSOFT` (
   'The compiler builds one dispatcher at `mtvec`: it saves the caller-saved registers, reads `mcause` '
   'and calls the matching `ON IRQ` block.',
   'Interrupts are not enabled by the compiler. Enable them with inline assembly as above.',
+  'The dispatcher returns without `mret`: it restores the registers, loads the return address into '
+  '`TP`, sets `mstatus.MIE` and jumps. Some cores execute `mret` as a no-op; the AMD MicroBlaze V '
+  'MCS does. `TP` is therefore reserved in programs with `ON IRQ`.',
   'Use `ATOMIC` for read-modify-write of data that a handler also changes.')
 H2('Board initialisation: SUB BoardInit')
 CODE('''SUB BoardInit

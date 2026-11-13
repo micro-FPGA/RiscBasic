@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# License: MIT
+# Copyright 7AG (2026) MicroFPGA UG(h)
+# https://github.com/micro-FPGA/RiscBasic
+
 """
 mem2elf: convert a $readmemh .mem file (one 32-bit word per line) into an ELF32 RISC-V executable.
 

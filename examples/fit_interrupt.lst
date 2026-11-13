@@ -1,0 +1,568 @@
+; License: MIT
+; Copyright 7AG (2026) MicroFPGA UG(h)
+; https://github.com/micro-FPGA/RiscBasic
+;
+; RiscBasic 0.35 listing: fit_interrupt.bas
+; TARGET RV32IC   CODE 0x00000000 size 14336   RAM 0x00003800 size 2048   GP = 0x00004000
+; compressed (C) instructions are marked c.; forward branches and calls stay 32-bit
+;
+; 0001  ' RiscBasic example: MicroBlaze V MCS, FIT1 interrupt through the IO Module INTC
+; 0002  '
+; 0003  ' MicroBlaze V MCS IP settings (Vivado, customize IP):
+; 0004  '   FIT1: Use FIT = on, Number of Clocks Between Strobes = 100000, Generate Interrupt = on
+; 0005  '   GPO1 and GPI1 for the LEDs and the button, UART on (as in include/CPU/MCS-V.bas)
+; 0006  ' With an interrupt enabled, the MCS-V runs MicroBlaze V with low-latency interrupts: the
+; 0007  ' core jumps to the vector the IO Module supplies. IntcInit points all vectors at the
+; 0008  ' RiscBasic interrupt dispatcher (see MCS-V_INTC.bas).
+; 0009  '
+; 0010  ' The FIT strobes every FIT1_CLOCKS clocks: 1000 interrupts per second at 100 MHz. The
+; 0011  ' interrupt handler counts them and blinks the green LED; the main program prints the
+; 0012  ' uptime once per second and shows the button on the red LED.
+; 0014  .include "include/CPU/MCS-V.bas"
+; include/CPU/MCS-V.bas:0001  '
+; include/CPU/MCS-V.bas:0002  ' AMD MicroBlaze MCS-V with 16K and compressed instruction support
+; include/CPU/MCS-V.bas:0003  '
+; include/CPU/MCS-V.bas:0005  TARGET RV32IC
+; include/CPU/MCS-V.bas:0006  CLOCK  100_000_000
+; include/CPU/MCS-V.bas:0007  CODE   AT &H0000 SIZE 14336
+; include/CPU/MCS-V.bas:0008  RAM    AT &H3800 SIZE 2048
+; include/CPU/MCS-V.bas:0010  '
+; include/CPU/MCS-V.bas:0011  ' AMD IO Module
+; include/CPU/MCS-V.bas:0012  '
+; include/CPU/MCS-V.bas:0013  DEVICE GPIO0 AT &H8000_0000
+; include/CPU/MCS-V.bas:0014  REG OUT  AT +16  WRITEONLY
+; include/CPU/MCS-V.bas:0015  REG IN   AT +32  READONLY
+; include/CPU/MCS-V.bas:0016  END DEVICE
+; include/CPU/MCS-V.bas:0018  DEVICE UART0 AT &H8000_0000
+; include/CPU/MCS-V.bas:0019  REG RXDATA AT +0 READONLY     ' RX FIFO
+; include/CPU/MCS-V.bas:0020  REG DATA   AT +4 : 8
+; include/CPU/MCS-V.bas:0021  REG STAT   AT +8 READONLY
+; include/CPU/MCS-V.bas:0022  BIT RXREADY = STAT.0          ' RX FIFO has data
+; include/CPU/MCS-V.bas:0023  BIT TXREADY = NOT STAT.3
+; include/CPU/MCS-V.bas:0024  END DEVICE
+; 0015  .include "include/CPU/MCS-V_INTC.bas"
+; include/CPU/MCS-V_INTC.bas:0001  '
+; include/CPU/MCS-V_INTC.bas:0002  ' AMD MicroBlaze V MCS: interrupt controller (INTC) of the IO Module
+; include/CPU/MCS-V_INTC.bas:0003  '
+; include/CPU/MCS-V_INTC.bas:0004  ' Register offsets and interrupt numbers from the IO Module driver
+; include/CPU/MCS-V_INTC.bas:0005  ' (embeddedsw iomodule_v2_19, xiomodule_l.h, Vitis 2025.2).
+; include/CPU/MCS-V_INTC.bas:0006  ' Include after include/CPU/MCS-V.bas.
+; include/CPU/MCS-V_INTC.bas:0007  '
+; include/CPU/MCS-V_INTC.bas:0009  CONST IOM_BASE = &H8000_0000
+; include/CPU/MCS-V_INTC.bas:0011  DEVICE IOM AT &H8000_0000
+; include/CPU/MCS-V_INTC.bas:0012  REG MODE    AT +&H0C WRITEONLY    ' IRQ_MODE: per interrupt 1 = fast (vectored), 0 = normal
+; include/CPU/MCS-V_INTC.bas:0013  REG STATUS  AT +&H30 READONLY     ' IRQ_STATUS: latched interrupt requests
+; include/CPU/MCS-V_INTC.bas:0014  REG PENDING AT +&H34 READONLY     ' IRQ_PENDING: STATUS AND ENABLE
+; include/CPU/MCS-V_INTC.bas:0015  REG ENABLE  AT +&H38 WRITEONLY    ' IRQ_ENABLE: cannot be read back, RiscBasic keeps a shadow
+; include/CPU/MCS-V_INTC.bas:0016  REG ACK     AT +&H3C              ' IRQ_ACK: write a mask of 1s to clear STATUS bits.
+; include/CPU/MCS-V_INTC.bas:0017  ' Write whole masks only: ACK cannot be read, so a bit
+; include/CPU/MCS-V_INTC.bas:0018  ' assignment (read-modify-write) would ack random bits.
+; include/CPU/MCS-V_INTC.bas:0019  BIT FIT1_PENDING = PENDING.7
+; include/CPU/MCS-V_INTC.bas:0020  BIT FIT1_ENABLE  = ENABLE.7
+; include/CPU/MCS-V_INTC.bas:0021  BIT PIT1_PENDING = PENDING.3
+; include/CPU/MCS-V_INTC.bas:0022  BIT PIT1_ENABLE  = ENABLE.3
+; include/CPU/MCS-V_INTC.bas:0023  END DEVICE
+; include/CPU/MCS-V_INTC.bas:0025  ' interrupt numbers (bit positions in STATUS, PENDING, ENABLE, ACK, MODE)
+; include/CPU/MCS-V_INTC.bas:0026  CONST IRQ_UART_ERR = 0
+; include/CPU/MCS-V_INTC.bas:0027  CONST IRQ_UART_TX  = 1
+; include/CPU/MCS-V_INTC.bas:0028  CONST IRQ_UART_RX  = 2
+; include/CPU/MCS-V_INTC.bas:0029  CONST IRQ_PIT1     = 3              ' PIT2..PIT4 = 4..6
+; include/CPU/MCS-V_INTC.bas:0030  CONST IRQ_FIT1     = 7              ' FIT2..FIT4 = 8..10
+; include/CPU/MCS-V_INTC.bas:0031  CONST IRQ_GPI1     = 11             ' GPI2..GPI4 = 12..14
+; include/CPU/MCS-V_INTC.bas:0032  CONST IRQ_EXT0     = 16             ' INTC_Interrupt inputs from bit 16 up
+; include/CPU/MCS-V_INTC.bas:0034  CONST FIT1_MASK = 1 SHL IRQ_FIT1
+; include/CPU/MCS-V_INTC.bas:0036  '
+; include/CPU/MCS-V_INTC.bas:0037  ' Put the INTC into a known state: all interrupts off and in normal mode, everything
+; include/CPU/MCS-V_INTC.bas:0038  ' acknowledged, and the interrupt vectors pointing at the RiscBasic interrupt dispatcher.
+; include/CPU/MCS-V_INTC.bas:0039  '
+; include/CPU/MCS-V_INTC.bas:0040  ' Vectors (IRQ_VECTOR, one word per interrupt from offset &H80): the MCS-V builds the IO
+; include/CPU/MCS-V_INTC.bas:0041  ' Module with fast interrupt support and runs MicroBlaze V with low-latency interrupts, where
+; include/CPU/MCS-V_INTC.bas:0042  ' the IO Module supplies a handler address with each interrupt. Every vector gets the address
+; include/CPU/MCS-V_INTC.bas:0043  ' of __trap, the dispatcher that runs the ON IRQ blocks; the startup code sets mtvec to it
+; include/CPU/MCS-V_INTC.bas:0044  ' too, so the interrupt reaches __trap whichever of the two the core uses.
+; include/CPU/MCS-V_INTC.bas:0045  ' On this core mret is a no-op; the RiscBasic dispatcher returns without it (spec section 7).
+; include/CPU/MCS-V_INTC.bas:0046  '
+; ---- startup ----
+                  __start:
+00000000  30047073   csrrci  zero, mstatus, 8
+00000004  00004137   lui     sp, 0x4
+00000008      6191   c.lui   gp, 0x4
+0000000A      6411   c.lui   s0, 0x4
+0000000C  80040413   addi    s0, s0, -2048
+00000010  000044B7   lui     s1, %hi(__ram_end)   ; = 0x4
+00000014  82048493   addi    s1, s1, %lo(__ram_end)   ; = -2016
+                  __clr:
+00000018  00947663   bgeu    s0, s1, __clr_done   ; -> 00000024
+0000001C  00042023   sw      zero, 0(s0)
+00000020      0411   c.addi  s0, 4
+00000022      BFDD   c.j     __clr   ; -> 00000018
+                  __clr_done:
+00000024  00000437   lui     s0, %hi(__trap)   ; = 0x0
+00000028  28840413   addi    s0, s0, %lo(__trap)   ; = 648
+0000002C  30541073   csrrw   zero, mtvec, s0
+; ---- program ----
+                  main:
+; include/CPU/MCS-V_INTC.bas:0047  SUB IntcInit
+00000030      A885   c.j     _L1   ; -> 000000A0
+; ---- SUB INTCINIT ----
+                  sub_INTCINIT:
+00000032      1171   c.addi  sp, -4
+00000034      C006   c.swsp  ra, 0(sp)
+; include/CPU/MCS-V_INTC.bas:0048  IOM.ENABLE = 0
+00000036  8001A023   sw      zero, -2048(gp)
+0000003A  800007B7   lui     a5, 0x80000
+0000003E  0207AC23   sw      zero, 56(a5)
+; include/CPU/MCS-V_INTC.bas:0049  IOM.MODE = 0
+00000042  8001A223   sw      zero, -2044(gp)
+00000046  0007A623   sw      zero, 12(a5)
+; include/CPU/MCS-V_INTC.bas:0050  IOM.ACK = &HFFFF_FFFF
+0000004A      547D   c.li    s0, -1
+0000004C      DFC0   c.sw    s0, 60(a5)
+; include/CPU/MCS-V_INTC.bas:0051  ASM
+; include/CPU/MCS-V_INTC.bas:0052      la   t0, __trap
+0000004E  000002B7   lui     t0, %hi(__trap)   ; = 0x0
+00000052  28828293   addi    t0, t0, %lo(__trap)   ; = 648
+; include/CPU/MCS-V_INTC.bas:0053      lui  t1, 0x80000
+00000056  80000337   lui     t1, 0x80000
+; include/CPU/MCS-V_INTC.bas:0054      sw   t0, 0x80(t1)
+0000005A  08532023   sw      t0, 128(t1)
+; include/CPU/MCS-V_INTC.bas:0055      sw   t0, 0x84(t1)
+0000005E  08532223   sw      t0, 132(t1)
+; include/CPU/MCS-V_INTC.bas:0056      sw   t0, 0x88(t1)
+00000062  08532423   sw      t0, 136(t1)
+; include/CPU/MCS-V_INTC.bas:0057      sw   t0, 0x8C(t1)
+00000066  08532623   sw      t0, 140(t1)
+; include/CPU/MCS-V_INTC.bas:0058      sw   t0, 0x90(t1)
+0000006A  08532823   sw      t0, 144(t1)
+; include/CPU/MCS-V_INTC.bas:0059      sw   t0, 0x94(t1)
+0000006E  08532A23   sw      t0, 148(t1)
+; include/CPU/MCS-V_INTC.bas:0060      sw   t0, 0x98(t1)
+00000072  08532C23   sw      t0, 152(t1)
+; include/CPU/MCS-V_INTC.bas:0061      sw   t0, 0x9C(t1)
+00000076  08532E23   sw      t0, 156(t1)
+; include/CPU/MCS-V_INTC.bas:0062      sw   t0, 0xA0(t1)
+0000007A  0A532023   sw      t0, 160(t1)
+; include/CPU/MCS-V_INTC.bas:0063      sw   t0, 0xA4(t1)
+0000007E  0A532223   sw      t0, 164(t1)
+; include/CPU/MCS-V_INTC.bas:0064      sw   t0, 0xA8(t1)
+00000082  0A532423   sw      t0, 168(t1)
+; include/CPU/MCS-V_INTC.bas:0065      sw   t0, 0xAC(t1)
+00000086  0A532623   sw      t0, 172(t1)
+; include/CPU/MCS-V_INTC.bas:0066      sw   t0, 0xB0(t1)
+0000008A  0A532823   sw      t0, 176(t1)
+; include/CPU/MCS-V_INTC.bas:0067      sw   t0, 0xB4(t1)
+0000008E  0A532A23   sw      t0, 180(t1)
+; include/CPU/MCS-V_INTC.bas:0068      sw   t0, 0xB8(t1)
+00000092  0A532C23   sw      t0, 184(t1)
+; include/CPU/MCS-V_INTC.bas:0069      sw   t0, 0xBC(t1)
+00000096  0A532E23   sw      t0, 188(t1)
+; include/CPU/MCS-V_INTC.bas:0070    END ASM
+; include/CPU/MCS-V_INTC.bas:0071  END SUB
+                  _L2:
+0000009A      4082   c.lwsp  ra, 0(sp)
+0000009C      0111   c.addi  sp, 4
+0000009E      8082   c.jr    ra
+; ---- program ----
+                  _L1:
+; include/CPU/MCS-V_INTC.bas:0073  '
+; include/CPU/MCS-V_INTC.bas:0074  ' Machine external interrupt on (mie.MEIE, bit 11), then global interrupts on (mstatus.MIE).
+; include/CPU/MCS-V_INTC.bas:0075  '
+; include/CPU/MCS-V_INTC.bas:0076  SUB IrqOn
+000000A0      A829   c.j     _L3   ; -> 000000BA
+; ---- SUB IRQON ----
+                  sub_IRQON:
+000000A2      1171   c.addi  sp, -4
+000000A4      C006   c.swsp  ra, 0(sp)
+; include/CPU/MCS-V_INTC.bas:0077  ASM
+; include/CPU/MCS-V_INTC.bas:0078      li     t0, 0x800
+000000A6      6285   c.lui   t0, 0x1
+000000A8  80028293   addi    t0, t0, -2048
+; include/CPU/MCS-V_INTC.bas:0079      csrrs  zero, mie, t0
+000000AC  3042A073   csrrs   zero, mie, t0
+; include/CPU/MCS-V_INTC.bas:0080      csrrsi zero, mstatus, 8
+000000B0  30046073   csrrsi  zero, mstatus, 8
+; include/CPU/MCS-V_INTC.bas:0081    END ASM
+; include/CPU/MCS-V_INTC.bas:0082  END SUB
+                  _L4:
+000000B4      4082   c.lwsp  ra, 0(sp)
+000000B6      0111   c.addi  sp, 4
+000000B8      8082   c.jr    ra
+; ---- program ----
+                  _L3:
+; 0016  .include "include/boards/CR00107.bas"
+; include/boards/CR00107.bas:0001  ALIAS LED  = GPIO0.OUT.0
+; include/boards/CR00107.bas:0002  ALIAS GREEN_LED  = GPIO0.OUT.0
+; include/boards/CR00107.bas:0003  ALIAS RED_LED    = GPIO0.OUT.1
+; include/boards/CR00107.bas:0004  ALIAS BUTTON = GPIO0.IN.0
+; 0017  .include "lib/uart.bas"
+; lib/uart.bas:0001  '
+; lib/uart.bas:0002  '
+; lib/uart.bas:0003  '
+; lib/uart.bas:0004  CONST CR = 13
+; lib/uart.bas:0005  CONST LF = 10
+; lib/uart.bas:0007  CONSOLE UART0
+; lib/uart.bas:0009  SUB NewLine
+000000BA      A811   c.j     _L5   ; -> 000000CE
+; ---- SUB NEWLINE ----
+                  sub_NEWLINE:
+000000BC      1171   c.addi  sp, -4
+000000BE      C006   c.swsp  ra, 0(sp)
+; lib/uart.bas:0010  PRINT CR, LF
+000000C0      4435   c.li    s0, 13
+000000C2      223D   c.jal   __putc_UART0   ; -> 000001F0
+000000C4      4429   c.li    s0, 10
+000000C6      222D   c.jal   __putc_UART0   ; -> 000001F0
+; lib/uart.bas:0011  END SUB
+                  _L6:
+000000C8      4082   c.lwsp  ra, 0(sp)
+000000CA      0111   c.addi  sp, 4
+000000CC      8082   c.jr    ra
+; ---- program ----
+                  _L5:
+; 0019  CONST CPU_HZ = 100_000_000                  ' the CLOCK of MCS-V.bas
+; 0020  #IF NOT DEFINED(FIT1_CLOCKS)
+; 0021  CONST FIT1_CLOCKS = 100_000                 ' must match "Number of Clocks Between Strobes"
+; 0022  #ENDIF
+; 0023  CONST TICK_HZ = CPU_HZ / FIT1_CLOCKS        ' interrupts per second
+; 0024  #IF CPU_HZ MOD FIT1_CLOCKS <> 0
+; 0025  #ERROR "FIT1_CLOCKS must divide the CPU clock evenly"
+; 0026  #ENDIF
+; 0028  DIM ticks   AS WORD                         ' FIT interrupts since start
+; 0029  DIM seconds AS WORD                         ' set by the interrupt handler
+; 0030  DIM ms      AS WORD                         ' ticks within the current second
+; 0031  DIM shown   AS WORD                         ' last second printed by the main loop
+; 0032  DIM lastbtn AS WORD                         ' button state last shown on the red LED
+; 0034  ON IRQ MEXT                                 ' IO Module INTC -> MicroBlaze V external interrupt
+000000CE      A095   c.j     _L7   ; -> 00000132
+; ---- IRQ 11 ----
+                  __irq11:
+000000D0      1171   c.addi  sp, -4
+000000D2      C006   c.swsp  ra, 0(sp)
+; 0035  IF IOM.FIT1_PENDING THEN
+000000D4  800007B7   lui     a5, 0x80000
+000000D8      5BC0   c.lw    s0, 52(a5)
+000000DA  08047413   andi    s0, s0, 128
+000000DE      C439   c.beqz  s0, _L9   ; -> 0000012C
+; 0036  IOM.ACK = FIT1_MASK                     ' first: the interrupt line stays active until ack
+000000E0  08000413   addi    s0, zero, 128
+000000E4      DFC0   c.sw    s0, 60(a5)
+; 0037  ticks = ticks + 1
+000000E6  8081A403   lw      s0, -2040(gp)
+000000EA      0405   c.addi  s0, 1
+000000EC  8081A423   sw      s0, -2040(gp)
+; 0038  ms = ms + 1
+000000F0  8101A403   lw      s0, -2032(gp)
+000000F4      0405   c.addi  s0, 1
+000000F6  8081A823   sw      s0, -2032(gp)
+; 0039  IF ms = TICK_HZ THEN
+000000FA  8101A403   lw      s0, -2032(gp)
+000000FE  3E800493   addi    s1, zero, 1000
+00000102  02941563   bne     s0, s1, _L11   ; -> 0000012C
+; 0040  ms = 0
+00000106  8001A823   sw      zero, -2032(gp)
+; 0041  seconds = seconds + 1
+0000010A  80C1A403   lw      s0, -2036(gp)
+0000010E      0405   c.addi  s0, 1
+00000110  8081A623   sw      s0, -2036(gp)
+; 0042  GREEN_LED = NOT GREEN_LED             ' 1 s on, 1 s off
+00000114  81C1A403   lw      s0, -2020(gp)
+00000118      8805   c.andi  s0, 1
+0000011A  00144413   xori    s0, s0, 1
+0000011E  81C1A483   lw      s1, -2020(gp)
+00000122      98F9   c.andi  s1, -2
+00000124      8CC1   c.or    s1, s0
+00000126  8091AE23   sw      s1, -2020(gp)
+0000012A      CB84   c.sw    s1, 16(a5)
+; 0043  END IF
+                  _L11:
+                  _L12:
+; 0044  END IF
+                  _L9:
+                  _L10:
+; 0045  END IRQ
+                  _L8:
+0000012C      4082   c.lwsp  ra, 0(sp)
+0000012E      0111   c.addi  sp, 4
+00000130      8082   c.jr    ra
+; ---- program ----
+                  _L7:
+; 0047  IntcInit                                    ' known INTC state, standard vectors
+00000132      3701   c.jal   sub_INTCINIT   ; -> 00000032
+; 0048  IOM.FIT1_ENABLE = 1                         ' IRQ_ENABLE is write-only: set in the shadow
+00000134  8001A403   lw      s0, -2048(gp)
+00000138  08046413   ori     s0, s0, 128
+0000013C  8081A023   sw      s0, -2048(gp)
+00000140  800007B7   lui     a5, 0x80000
+00000144      DF80   c.sw    s0, 56(a5)
+; 0049  IrqOn                                       ' mie.MEIE and mstatus.MIE
+00000146      3FB1   c.jal   sub_IRQON   ; -> 000000A2
+; 0051  PRINT "RiscBasic FIT1 interrupt demo, ", DEC TICK_HZ, " interrupts per second", CR, LF
+00000148  00000437   lui     s0, %hi(__str0)   ; = 0x0
+0000014C  31C40413   addi    s0, s0, %lo(__str0)   ; = 796
+00000150      286D   c.jal   __puts_UART0   ; -> 0000020A
+00000152  3E800413   addi    s0, zero, 1000
+00000156      4481   c.li    s1, 0
+00000158      20F9   c.jal   __putdec_UART0   ; -> 00000226
+0000015A  00000437   lui     s0, %hi(__str1)   ; = 0x0
+0000015E  33C40413   addi    s0, s0, %lo(__str1)   ; = 828
+00000162      2065   c.jal   __puts_UART0   ; -> 0000020A
+; 0053  lastbtn = 2                                 ' not 0 or 1: show the button state at once
+00000164      4409   c.li    s0, 2
+00000166  8081AC23   sw      s0, -2024(gp)
+; 0054  DO
+                  _L13:
+; 0055  IF seconds <> shown THEN
+0000016A  80C1A403   lw      s0, -2036(gp)
+0000016E  8141A483   lw      s1, -2028(gp)
+00000172  02940C63   beq     s0, s1, _L15   ; -> 000001AA
+; 0056  shown = seconds
+00000176  80C1A403   lw      s0, -2036(gp)
+0000017A  8081AA23   sw      s0, -2028(gp)
+; 0057  PRINT "uptime ", DEC shown, " s, ticks ", DEC ticks, CR, LF
+0000017E  00000437   lui     s0, %hi(__str2)   ; = 0x0
+00000182  35840413   addi    s0, s0, %lo(__str2)   ; = 856
+00000186      2051   c.jal   __puts_UART0   ; -> 0000020A
+00000188  8141A403   lw      s0, -2028(gp)
+0000018C      4481   c.li    s1, 0
+0000018E      2861   c.jal   __putdec_UART0   ; -> 00000226
+00000190  00000437   lui     s0, %hi(__str3)   ; = 0x0
+00000194  36040413   addi    s0, s0, %lo(__str3)   ; = 864
+00000198      288D   c.jal   __puts_UART0   ; -> 0000020A
+0000019A  8081A403   lw      s0, -2040(gp)
+0000019E      4481   c.li    s1, 0
+000001A0      2059   c.jal   __putdec_UART0   ; -> 00000226
+000001A2      4435   c.li    s0, 13
+000001A4      20B1   c.jal   __putc_UART0   ; -> 000001F0
+000001A6      4429   c.li    s0, 10
+000001A8      20A1   c.jal   __putc_UART0   ; -> 000001F0
+; 0058  END IF
+                  _L15:
+                  _L16:
+; 0059  IF BUTTON <> lastbtn THEN                 ' only on a change: interrupts stay on in the loop
+000001AA  800007B7   lui     a5, 0x80000
+000001AE      5380   c.lw    s0, 32(a5)
+000001B0      8805   c.andi  s0, 1
+000001B2  8181A483   lw      s1, -2024(gp)
+000001B6  02940B63   beq     s0, s1, _L17   ; -> 000001EC
+; 0060  lastbtn = BUTTON
+000001BA      5380   c.lw    s0, 32(a5)
+000001BC      8805   c.andi  s0, 1
+000001BE  8081AC23   sw      s0, -2024(gp)
+; 0061  ATOMIC RED_LED = (lastbtn = 0)          ' GPO1 shadow is shared with the handler
+000001C2  30047473   csrrci  s0, mstatus, 8
+000001C6      8821   c.andi  s0, 8
+000001C8      1171   c.addi  sp, -4
+000001CA      C022   c.swsp  s0, 0(sp)
+000001CC  8181A403   lw      s0, -2024(gp)
+000001D0  00143413   sltiu   s0, s0, 1
+000001D4      0406   c.slli  s0, 1
+000001D6  81C1A483   lw      s1, -2020(gp)
+000001DA      98F5   c.andi  s1, -3
+000001DC      8CC1   c.or    s1, s0
+000001DE  8091AE23   sw      s1, -2020(gp)
+000001E2      CB84   c.sw    s1, 16(a5)
+000001E4      4402   c.lwsp  s0, 0(sp)
+000001E6      0111   c.addi  sp, 4
+000001E8  30042073   csrrs   zero, mstatus, s0
+; 0062  END IF
+                  _L17:
+                  _L18:
+; 0063  LOOP
+000001EC      BFBD   c.j     _L13   ; -> 0000016A
+                  _L14:
+; ---- end of program ----
+                  __end:
+000001EE      A001   c.j     __end   ; -> 000001EE
+; ---- runtime __putc_UART0 ----
+                  __putc_UART0:
+000001F0      1171   c.addi  sp, -4
+000001F2      C02A   c.swsp  a0, 0(sp)
+000001F4  80000537   lui     a0, 0x80000
+000001F8      0521   c.addi  a0, 8
+                  __putc_UART0_w:
+000001FA      4104   c.lw    s1, 0(a0)
+000001FC      88A1   c.andi  s1, 8
+000001FE      FCF5   c.bnez  s1, __putc_UART0_w   ; -> 000001FA
+00000200  FE850E23   sb      s0, -4(a0)
+00000204      4502   c.lwsp  a0, 0(sp)
+00000206      0111   c.addi  sp, 4
+00000208      8082   c.jr    ra
+; ---- runtime __puts_UART0 ----
+                  __puts_UART0:
+0000020A      1161   c.addi  sp, -8
+0000020C      C006   c.swsp  ra, 0(sp)
+0000020E      C22E   c.swsp  a1, 4(sp)
+00000210      85A2   c.mv    a1, s0
+                  __puts_UART0_l:
+00000212  0005C403   lbu     s0, 0(a1)
+00000216      C401   c.beqz  s0, __puts_UART0_x   ; -> 0000021E
+00000218      3FE1   c.jal   __putc_UART0   ; -> 000001F0
+0000021A      0585   c.addi  a1, 1
+0000021C      BFDD   c.j     __puts_UART0_l   ; -> 00000212
+                  __puts_UART0_x:
+0000021E      4082   c.lwsp  ra, 0(sp)
+00000220      4592   c.lwsp  a1, 4(sp)
+00000222      0121   c.addi  sp, 8
+00000224      8082   c.jr    ra
+; ---- runtime __putdec_UART0 ----
+                  __putdec_UART0:
+00000226      1131   c.addi  sp, -20
+00000228      C006   c.swsp  ra, 0(sp)
+0000022A      C22E   c.swsp  a1, 4(sp)
+0000022C      C432   c.swsp  a2, 8(sp)
+0000022E      C636   c.swsp  a3, 12(sp)
+00000230      C83A   c.swsp  a4, 16(sp)
+00000232      85A2   c.mv    a1, s0
+00000234      C881   c.beqz  s1, __putdec_UART0_u   ; -> 00000244
+00000236  0005D763   bge     a1, zero, __putdec_UART0_u   ; -> 00000244
+0000023A  40B005B3   sub     a1, zero, a1
+0000023E  02D00413   addi    s0, zero, 45
+00000242      377D   c.jal   __putc_UART0   ; -> 000001F0
+                  __putdec_UART0_u:
+00000244  00000637   lui     a2, %hi(__pow10)   ; = 0x0
+00000248  36C60613   addi    a2, a2, %lo(__pow10)   ; = 876
+0000024C      4681   c.li    a3, 0
+                  __putdec_UART0_l:
+0000024E      4218   c.lw    a4, 0(a2)
+00000250  03000413   addi    s0, zero, 48
+                  __putdec_UART0_s:
+00000254  00E5E563   bltu    a1, a4, __putdec_UART0_e   ; -> 0000025E
+00000258      8D99   c.sub   a1, a4
+0000025A      0405   c.addi  s0, 1
+0000025C      BFE5   c.j     __putdec_UART0_s   ; -> 00000254
+                  __putdec_UART0_e:
+0000025E      0611   c.addi  a2, 4
+00000260      4485   c.li    s1, 1
+00000262  00970763   beq     a4, s1, __putdec_UART0_p   ; -> 00000270
+00000266      E689   c.bnez  a3, __putdec_UART0_p   ; -> 00000270
+00000268  03000493   addi    s1, zero, 48
+0000026C  FE9401E3   beq     s0, s1, __putdec_UART0_l   ; -> 0000024E
+                  __putdec_UART0_p:
+00000270      4685   c.li    a3, 1
+00000272      3FBD   c.jal   __putc_UART0   ; -> 000001F0
+00000274      4485   c.li    s1, 1
+00000276  FC971CE3   bne     a4, s1, __putdec_UART0_l   ; -> 0000024E
+0000027A      4082   c.lwsp  ra, 0(sp)
+0000027C      4592   c.lwsp  a1, 4(sp)
+0000027E      4622   c.lwsp  a2, 8(sp)
+00000280      46B2   c.lwsp  a3, 12(sp)
+00000282      4742   c.lwsp  a4, 16(sp)
+00000284      0151   c.addi  sp, 20
+00000286      8082   c.jr    ra
+; ---- trap dispatcher ----
+                  __trap:
+00000288  FB810113   addi    sp, sp, -72
+0000028C      C006   c.swsp  ra, 0(sp)
+0000028E      C216   c.swsp  t0, 4(sp)
+00000290      C41A   c.swsp  t1, 8(sp)
+00000292      C61E   c.swsp  t2, 12(sp)
+00000294      C822   c.swsp  s0, 16(sp)
+00000296      CA26   c.swsp  s1, 20(sp)
+00000298      CC2A   c.swsp  a0, 24(sp)
+0000029A      CE2E   c.swsp  a1, 28(sp)
+0000029C      D032   c.swsp  a2, 32(sp)
+0000029E      D236   c.swsp  a3, 36(sp)
+000002A0      D43A   c.swsp  a4, 40(sp)
+000002A2      D63E   c.swsp  a5, 44(sp)
+000002A4      D842   c.swsp  a6, 48(sp)
+000002A6      DA46   c.swsp  a7, 52(sp)
+000002A8      DC72   c.swsp  t3, 56(sp)
+000002AA      DE76   c.swsp  t4, 60(sp)
+000002AC      C0FA   c.swsp  t5, 64(sp)
+000002AE      C2FE   c.swsp  t6, 68(sp)
+000002B0  34102373   csrrs   t1, mepc, zero
+000002B4  000003B7   lui     t2, %hi(__trap_jump)   ; = 0x0
+000002B8  31838393   addi    t2, t2, %lo(__trap_jump)   ; = 792
+000002BC  00731463   bne     t1, t2, __trap_go   ; -> 000002C4
+000002C0  34121073   csrrw   zero, mepc, tp
+                  __trap_go:
+000002C4  34202373   csrrs   t1, mcause, zero
+000002C8  00035B63   bge     t1, zero, __trap_exc   ; -> 000002DE
+000002CC      0306   c.slli  t1, 1
+000002CE  00135313   srli    t1, t1, 1
+000002D2      43AD   c.li    t2, 11
+000002D4  00731463   bne     t1, t2, __trap_n11   ; -> 000002DC
+000002D8      3BE5   c.jal   __irq11   ; -> 000000D0
+000002DA      A039   c.j     __trap_ret   ; -> 000002E8
+                  __trap_n11:
+000002DC      A031   c.j     __trap_ret   ; -> 000002E8
+                  __trap_exc:
+000002DE  34102373   csrrs   t1, mepc, zero
+000002E2      0311   c.addi  t1, 4
+000002E4  34131073   csrrw   zero, mepc, t1
+                  __trap_ret:
+000002E8      4082   c.lwsp  ra, 0(sp)
+000002EA      4292   c.lwsp  t0, 4(sp)
+000002EC      4322   c.lwsp  t1, 8(sp)
+000002EE      43B2   c.lwsp  t2, 12(sp)
+000002F0      4442   c.lwsp  s0, 16(sp)
+000002F2      44D2   c.lwsp  s1, 20(sp)
+000002F4      4562   c.lwsp  a0, 24(sp)
+000002F6      45F2   c.lwsp  a1, 28(sp)
+000002F8      5602   c.lwsp  a2, 32(sp)
+000002FA      5692   c.lwsp  a3, 36(sp)
+000002FC      5722   c.lwsp  a4, 40(sp)
+000002FE      57B2   c.lwsp  a5, 44(sp)
+00000300      5842   c.lwsp  a6, 48(sp)
+00000302      58D2   c.lwsp  a7, 52(sp)
+00000304      5E62   c.lwsp  t3, 56(sp)
+00000306      5EF2   c.lwsp  t4, 60(sp)
+00000308      4F06   c.lwsp  t5, 64(sp)
+0000030A      4F96   c.lwsp  t6, 68(sp)
+0000030C  04810113   addi    sp, sp, 72
+00000310  34102273   csrrs   tp, mepc, zero
+00000314  30046073   csrrsi  zero, mstatus, 8
+                  __trap_jump:
+00000318      8202   c.jr    tp
+; ---- data ----
+0000031A      0001   c.nop   (align)
+                  __str0:
+0000031C  63736952   .asciz "RiscBasic FIT1 interrupt demo, "
+00000320  69736142   .word   0x69736142
+00000324  49462063   .word   0x49462063
+00000328  69203154   .word   0x69203154
+0000032C  7265746E   .word   0x7265746E
+00000330  74707572   .word   0x74707572
+00000334  6D656420   .word   0x6D656420
+00000338  00202C6F   .word   0x00202C6F
+                  __str1:
+0000033C  746E6920   .asciz " interrupts per second\r\n"
+00000340  75727265   .word   0x75727265
+00000344  20737470   .word   0x20737470
+00000348  20726570   .word   0x20726570
+0000034C  6F636573   .word   0x6F636573
+00000350  0A0D646E   .word   0x0A0D646E
+00000354  00000000   .word   0x00000000
+                  __str2:
+00000358  69747075   .asciz "uptime "
+0000035C  0020656D   .word   0x0020656D
+                  __str3:
+00000360  202C7320   .asciz " s, ticks "
+00000364  6B636974   .word   0x6B636974
+00000368  00002073   .word   0x00002073
+                  __pow10:
+0000036C  3B9ACA00   .word   1000000000
+00000370  05F5E100   .word   100000000
+00000374  00989680   .word   10000000
+00000378  000F4240   .word   1000000
+0000037C  000186A0   .word   100000
+00000380  00002710   .word   10000
+00000384  000003E8   .word   1000
+00000388  00000064   .word   100
+0000038C  0000000A   .word   10
+00000390  00000001   .word   1
+;
+; ---- summary ----
+;   program                         496 bytes   0x00000000 - 0x000001F0
+;   SUB INTCINIT                    110 bytes   0x00000032 - 0x000000A0
+;   SUB IRQON                        24 bytes   0x000000A2 - 0x000000BA
+;   SUB NEWLINE                      18 bytes   0x000000BC - 0x000000CE
+;   IRQ 11                           98 bytes   0x000000D0 - 0x00000132
+;   runtime __putc_UART0             26 bytes   0x000001F0 - 0x0000020A
+;   runtime __puts_UART0             28 bytes   0x0000020A - 0x00000226
+;   runtime __putdec_UART0           98 bytes   0x00000226 - 0x00000288
+;   trap dispatcher                 146 bytes   0x00000288 - 0x0000031A
+;   data                            120 bytes   0x0000031C - 0x00000394
+;   code used 916 of 14336 bytes (6%)
+;   compressed instructions: 169 of 313, 338 bytes saved
+;   RAM variables 32 bytes, stack 256 bytes, RAM 2048 bytes

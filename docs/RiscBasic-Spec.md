@@ -1,6 +1,6 @@
 # RiscBasic — Language Specification
 
-**Draft 0.26** — 12 November 2026 (7 AG)
+**Draft 0.28** — 12 November 2026 (7 AG)
 Language design: Antti Lukats (Identor #1). Drafting: Claude (Identor #9).
 
 ---
@@ -113,6 +113,7 @@ Reserved by the compiler:
 - `GP` (`R3`) points into RAM for one-instruction variable access (section 3.3). Writing it is a compile error.
 - `SP` (`R2`) is the stack pointer. Writing it gives a warning.
 - `RA` (`R1`) is the return address. Using it is legal, but the compiler warns if the program also uses `SUB` or `FUNCTION`.
+- `TP` (`R4`) is reserved in programs with `ON IRQ`: the interrupt return uses it (section 7). Otherwise it is free.
 
 On `RV32E` targets only `R0`–`R15` exist.
 
@@ -208,6 +209,7 @@ Types: `BIT`, `BYTE`, `HALF` (16-bit), `WORD` (32-bit), and signed `SBYTE`, `SHA
 - **Register variables** (`IN Rn`) always live in their register.
 - Startup code sets `GP = RAM base + 2048`, so variables in the first 4 KB of RAM are reached with one `LW` / `SW` and a 12-bit offset.
 - `BIT` variables in RAM take one byte each.
+- Bits and fields of variables and array elements can be read and assigned: `flags.3 = 1`, `buf(i)[7:4] = 5`. An assignment is a read-modify-write of the variable or element.
 
 ### 3.4 Memory access (MEM)
 
@@ -222,7 +224,7 @@ IF MEM[p].31 THEN ...              ' a bit
 
 - `MEM[addr]` is a 32-bit word; `MEM8`, `MEM16` and `MEM32` give the width. Reads of `MEM8` and `MEM16` are zero-extended.
 - The address is a full 32-bit value: a constant or any expression. Parentheses work too: `MEM32(addr)` is the same as `MEM32[addr]`. The first `[ ]` after `MEM` is the address; a second `[hi:lo]` or `.n` selects bits.
-- A constant address costs no extra instruction when it is within 2 KB of `GP` (RAM) or of address 0 (also the top 2 KB, `&HFFFF_F800` to `&HFFFF_FFFF`); otherwise one `LUI` is added. A computed address is evaluated into a register first.
+- A constant address costs no extra instruction when it is within 2 KB of `GP` (RAM) or of address 0 (also the top 2 KB, `&HFFFF_F800` to `&HFFFF_FFFF`); otherwise one `LUI` is added. Back-to-back accesses with the same upper 20 address bits share one `LUI` (also device registers); a label, a call or a change of that register ends the sharing. A computed address is evaluated into a register first.
 - The address is not checked for alignment. A misaligned `MEM16` or `MEM` access does what the core does with it (trap or split access).
 - `MEM`, `MEM8`, `MEM16` and `MEM32` are reserved words.
 
@@ -252,7 +254,7 @@ Rules:
 - **Bits:** any source assigned to a bit destination is true if non-zero.
 - **Read-only destinations** (`R0`, `READONLY` registers, constants) are compile errors.
 - **Atomic:** `ATOMIC GPIO.OUT.3 = 1` disables interrupts around a read-modify-write.
-- **Device base addresses** are loaded once per statement. They are not cached between statements, so each statement's listing stands alone.
+- **Device base addresses** are loaded with one `LUI` into `A5`. Back-to-back statements that use the same upper 20 address bits share it (section 3.4), so a statement's listing may use an `A5` loaded by an earlier statement. After a label or a call it is loaded again.
 
 ---
 
@@ -387,6 +389,7 @@ END IRQ
 - **Register variables are global.** A SUB or FUNCTION sees and may change every register variable, so no registers are saved by the callee except `RA`. This differs from the standard RISC-V ABI, where `S` registers are callee-saved.
 - A global register variable that sits in an argument register (`A0`–`A4`, `A6`, `A7`) is saved by the caller around each call that uses that register, and restored afterwards. Inside a SUB, such a global is hidden by the parameter in the same register; using it there is a compile error.
 - Recursion is allowed. Stack use is checked against `STACK` at compile time where the call depth is known.
+- **Interrupt return without `mret`.** The interrupt dispatcher restores all registers, loads the return address into `TP`, sets `mstatus.MIE` and jumps (`jr tp`). Some cores execute `mret` and `ecall` as no-ops: the AMD MicroBlaze V MCS does (measured on hardware), so a handler that ends with `mret` never returns there. The IO Module of the MCS-V accepts `MIE` being set as the end of the interrupt. An interrupt taken between setting `MIE` and the jump continues at the address in `TP`. As a result `TP` is reserved in programs with `ON IRQ`; using it there is a compile error.
 - **`SUB BoardInit`**: if the program has a SUB of this name, the startup code calls it once, after the stack, `GP` and RAM clearing are set up and before the `main` label, where the BASIC program starts. It may be defined anywhere, also in an included file or inside an `#IF` branch (a board file can bring its own). It must be a `SUB` without parameters. Interrupts are not yet enabled when it runs. A program that also calls it with `CALL` runs it twice.
 
 ---
@@ -603,7 +606,9 @@ LOOP
 | 34 | Conditional compilation | `#IF` / `#ELSEIF` / `#ELSE` / `#ENDIF` on CONSTs defined above, `DEFINED(name)`, `#ERROR`, `-D NAME=value` | 0.24 |
 | 35 | Memory access | `MEM[addr]` (32-bit) and `MEM8` / `MEM16` / `MEM32` with `[ ]` or `( )`; full 32-bit address; fields and bits also with a computed address | 0.25 |
 | 36 | Board initialization | a `SUB BoardInit` (no parameters) is called by the startup code before `main` | 0.26 |
+| 37 | Array element bits and fields | `buf(i).n` and `buf(i)[hi:lo]` can be assigned (read-modify-write), with constant or computed index | 0.27 |
+| 38 | Interrupt return | No `mret`: restore registers, return address in `TP`, set `MIE`, `jr tp`; `TP` reserved with `ON IRQ` | 0.28 |
 
 ## 14. Open questions
 
-None at Draft 0.26.
+None at Draft 0.28.

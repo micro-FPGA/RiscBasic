@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# License: MIT
+# Copyright 7AG (2026) MicroFPGA UG(h)
+# https://github.com/micro-FPGA/RiscBasic
+
 """
 Cross-check RiscBasic output against the GNU RISC-V toolchain.
 
@@ -23,7 +27,9 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-sys.path.insert(0, ROOT)
+# the compiler and mem2elf: in source/ (GitHub layout) or next to tests/
+SRC = os.path.join(ROOT, 'source') if os.path.isfile(os.path.join(ROOT, 'source', 'riscbasic.py')) else ROOT
+sys.path.insert(0, SRC)
 sys.path.insert(0, HERE)
 
 import run_tests as T          # noqa: E402
@@ -139,7 +145,7 @@ def main():
                 lines_checked[0] += len(decoded)
                 arch = rb.elf_arch(c.ext).split('_')[0][:5] + ('m' if 'M' in c.ext else '') + \
                     ('c' if 'C' in c.ext else '') + ('_zbb' if 'ZBB' in c.ext else '')
-                subprocess.run([sys.executable, os.path.join(ROOT, 'mem2elf.py'), memf, '-o', base + 'm.elf',
+                subprocess.run([sys.executable, os.path.join(SRC, 'mem2elf.py'), memf, '-o', base + 'm.elf',
                                 '--arch', arch], check=True, capture_output=True)
                 subprocess.run([prefix + 'objcopy', '-O', 'binary', base + 'm.elf', base + 'm.bin'], check=True)
                 if open(base + 'm.bin', 'rb').read() != words:

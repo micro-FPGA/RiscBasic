@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
+# License: MIT
+# Copyright 7AG (2026) MicroFPGA UG(h)
+# https://github.com/micro-FPGA/RiscBasic
+
 """
-RiscBasic compiler v0.28
+RiscBasic compiler v0.35
 (v0.2: compressed instructions for RV32IC / RV32EC; v0.3: branch shrinking and far branches;
- v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers; v0.14: WRITEONLY registers with shadow; v0.15: REPEAT ... UNTIL; v0.16: CASE ranges; v0.17: CASE IS; v0.18: single-line ELSE binds to the nearest IF; v0.19: ':' separator; v0.20: strings; v0.21: LEN and string comparison; v0.22: LEFT$ RIGHT$ MID$ INSTR; v0.23: VAL; v0.24: .include; v0.25: #IF conditional compilation; v0.26: MEM[addr]; v0.27: SUB BoardInit; v0.28: LUI reuse)
+ v0.4: NOT bits and fields, runtime calls through RA; v0.5: temporaries in x8-x15; v0.6: ELF output; v0.7: PRINT without automatic line end, character constants; v0.8: DWARF line info; v0.9: CONSOLE; v0.10: CHR in PRINT; v0.11: INPUT; v0.12: LINE INPUT; v0.13: PRINT of BYTE buffers; v0.14: WRITEONLY registers with shadow; v0.15: REPEAT ... UNTIL; v0.16: CASE ranges; v0.17: CASE IS; v0.18: single-line ELSE binds to the nearest IF; v0.19: ':' separator; v0.20: strings; v0.21: LEN and string comparison; v0.22: LEFT$ RIGHT$ MID$ INSTR; v0.23: VAL; v0.24: .include; v0.25: #IF conditional compilation; v0.26: MEM[addr]; v0.27: SUB BoardInit; v0.28: LUI reuse; v0.29: MEM field writes via a variable address without the stack; v0.30: bit and field assignment to array elements; v0.31: array element fields without the stack; v0.32: MEM field writes with the shift merge; v0.33: constant moved to the right of commutative operators; v0.34: startup disables interrupts; v0.35: interrupt return without mret)
 
 Compiles RiscBasic (spec: RiscBasic-Spec.md, Draft 0.26) directly to RISC-V
 machine code in a single pass, without a linker.
@@ -22,7 +26,8 @@ import os
 import re
 import sys
 
-VERSION = '0.28'
+VERSION = '0.35'
+HEADER = ('License: MIT', 'Copyright 7AG (2026) MicroFPGA UG(h)', 'https://github.com/micro-FPGA/RiscBasic')
 
 # ---------------------------------------------------------------- registers
 
@@ -876,6 +881,9 @@ TYPES = {
 }
 IRQ_NAMES = {'MSOFT': 3, 'MTIMER': 7, 'MEXT': 11}
 CMP_OPS = ('=', '<>', '<', '>', '<=', '>=')
+# operators whose operands can change places: c OP x is x SWAP_OPS[OP] c
+SWAP_OPS = {'+': '+', '*': '*', 'AND': 'AND', 'OR': 'OR', 'XOR': 'XOR',
+            '=': '=', '<>': '<>', '<': '>', '>': '<', '<=': '>=', '>=': '<='}
 DECLARATIONS = {'TARGET', 'CLOCK', 'CPI', 'CODE', 'RAM', 'STACK', 'CONST',
                 'DEVICE', 'ALIAS', 'DIM', 'CONSOLE'}
 KEYWORDS = DECLARATIONS | {
@@ -2306,6 +2314,8 @@ class Compiler:
         isb = op in CMP_OPS or (op in ('AND', 'OR', 'XOR') and l.isbool and r.isbool)
         if l.k == 'const' and r.k == 'const':
             return Node('const', fold(op, l.a, r.a), isbool=isb)
+        if l.k == 'const' and op in SWAP_OPS:      # constant to the right: immediates, shifts for 4 * k
+            op, l, r = SWAP_OPS[op], r, l
         return Node('bin', (op, l, r), signed=l.signed or r.signed, isbool=isb)
 
     def mk_un(self, op, x):
@@ -2389,6 +2399,8 @@ class Compiler:
             r = BASIC_REGS[u]
             if r in (T0, T1, T2):
                 raise RBError('%s is reserved for the compiler' % tok.val)
+            if r == TP and self.has_irq:
+                raise RBError('TP is reserved for the interrupt return in programs with ON IRQ')
             if r == RA:
                 self.uses_ra = True
             if 'E' in self.ext and r > 15:
@@ -2527,27 +2539,27 @@ class Compiler:
             em.ins('slli', dst, src, 32 - lo - w)
             em.ins('srli', dst, dst, 32 - w)
 
-    def arr_addr(self, o):
-        """Address of an array element: returns (base reg, offset). Uses T1 (and T0)."""
+    def arr_addr(self, o, dst=T1):
+        """Address of an array element: returns (base reg, offset). Uses dst (and T0)."""
         size = o.width // 8
         idx = o.index
         if idx.k == 'const':
             return self.addr_base(o.addr + idx.a * size)
-        r = self.gen(idx, T1)
+        r = self.gen(idx, dst)
         if size == 2:
-            self.em.ins('slli', T1, r, 1)
-            r = T1
+            self.em.ins('slli', dst, r, 1)
+            r = dst
         elif size == 4:
-            self.em.ins('slli', T1, r, 2)
-            r = T1
+            self.em.ins('slli', dst, r, 2)
+            r = dst
         if self.ram_base is not None and fits12(o.addr - self.gpval) and \
                 self.ram_base <= o.addr < self.ram_base + self.ram_size:
-            self.em.ins('add', T1, r, GP)
-            return T1, o.addr - self.gpval
+            self.em.ins('add', dst, r, GP)
+            return dst, o.addr - self.gpval
         hi, lo = split_hi_lo(o.addr)
         self.em.lui(T0, hi)
-        self.em.ins('add', T1, r, T0)
-        return T1, lo
+        self.em.ins('add', dst, r, T0)
+        return dst, lo
 
     def load_obj(self, o, dst, force=False):
         em = self.em
@@ -2963,32 +2975,56 @@ class Compiler:
             self.em.li(tmp, v)
             self.em.ins('or', rd, src, tmp)
 
-    def position(self, n, lo, w, inv=False):
-        """Value in T1 -> (inverted if inv,) masked to w bits and shifted to bit lo."""
+    def position(self, n, lo, w, inv=False, r=T1, masked=True):
+        """Value in r -> (inverted if inv,) masked to w bits and shifted to bit lo.
+        masked=False leaves the bits above the field (merge_field with a wide mask drops them)."""
         em = self.em
         if w == 1:
             if inv:
                 if n.isbool:
-                    em.ins('xori', T1, T1, 1)
+                    em.ins('xori', r, r, 1)
                 else:
-                    em.ins('sltiu', T1, T1, 1)     # seqz: non-zero -> 0, zero -> 1
+                    em.ins('sltiu', r, r, 1)     # seqz: non-zero -> 0, zero -> 1
             elif not n.isbool:
-                em.ins('sltu', T1, ZERO, T1)
+                em.ins('sltu', r, ZERO, r)
             if lo:
-                em.ins('slli', T1, T1, lo)
+                em.ins('slli', r, r, lo)
             return
         if inv:
-            em.ins('xori', T1, T1, -1)
+            em.ins('xori', r, r, -1)
+        if not masked:
+            if lo:
+                em.ins('slli', r, r, lo)
+            return
         if lo + w == 32:
             if lo:
-                em.ins('slli', T1, T1, lo)
+                em.ins('slli', r, r, lo)
         elif w <= 11:
-            em.ins('andi', T1, T1, (1 << w) - 1)
+            em.ins('andi', r, r, (1 << w) - 1)
             if lo:
-                em.ins('slli', T1, T1, lo)
+                em.ins('slli', r, r, lo)
         else:
-            em.ins('slli', T1, T1, 32 - w)
-            em.ins('srli', T1, T1, 32 - w - lo)
+            em.ins('slli', r, r, 32 - w)
+            em.ins('srli', r, r, 32 - w - lo)
+
+    def merge_field(self, old, val, lo, w):
+        """old = old with bits lo+w-1..lo replaced by val, which is shifted to bit lo.
+        Needs no third register: a mask that does not fit ANDI is applied with shifts, as
+        old ^= ((old ^ val) & mask); then val may have bits above the field (position masked=False).
+        With the ANDI form, val must have no bits outside the field."""
+        em = self.em
+        mask = (((1 << w) - 1) << lo) & 0xFFFFFFFF
+        if fits12(s32(~mask)):
+            em.ins('andi', old, old, s32(~mask))
+            em.ins('or', old, old, val)
+            return
+        em.ins('xor', val, val, old)            # the field of val now holds old ^ new
+        if lo + w < 32:
+            em.ins('slli', val, val, 32 - lo - w)
+        em.ins('srli', val, val, 32 - w)        # only the field is left, at bit 0
+        if lo:
+            em.ins('slli', val, val, lo)
+        em.ins('xor', old, old, val)
 
     def assign_sub(self, o, n):
         em = self.em
@@ -3038,7 +3074,24 @@ class Compiler:
                     self.or_imm(T2, T2, setbits, T0)
                 em.ins(st, T2, 0, a)
                 return T2
-            self.gen(n, T1, True)
+            wide = not fits12(s32(~mask))           # merge_field uses shifts, which also mask
+            if self.leafish(base.aexpr):            # simple address: value first, address in T2
+                self.gen(n, T1, True)
+                self.position(n, lo, w, o.inv, masked=not wide)
+                a = self.gen(base.aexpr, T2)        # touches only T2 (and T0 for a far address)
+                em.ins(ld, T0, 0, a)
+                self.merge_field(T0, T1, lo, w)
+                em.ins(st, T0, 0, a)
+                return T0
+            if self.leafish(n):                     # simple value: address first, value in T2
+                a = self.gen(base.aexpr, T1)
+                self.gen(n, T2, True)
+                self.position(n, lo, w, o.inv, T2, masked=not wide)
+                em.ins(ld, T0, 0, a)
+                self.merge_field(T0, T2, lo, w)
+                em.ins(st, T0, 0, a)
+                return T0
+            self.gen(n, T1, True)                   # address and value both computed:
             self.position(n, lo, w, o.inv)
             self.push(T1)                           # the value waits on the stack
             a = self.gen(base.aexpr, T1)
@@ -3050,6 +3103,50 @@ class Compiler:
             em.ins('or', T1, T1, T0)
             em.ins(st, T1, 0, T2)
             return T1
+        if base.kind == 'arr':                      # array element: buf(i)[7:4] = v, flags(2).0 = 1
+            ld, st = self.ld(base.width, False), self.st(base.width)
+            if n.k == 'const':
+                b, ofs = self.arr_addr(base)        # base register: GP / zero, T0 (lui) or T1 (index)
+                tmp = T1 if b == T0 else T0
+                em.ins(ld, T2, ofs, b)
+                if setbits != mask:
+                    self.and_not(T2, T2, mask, tmp)
+                if setbits:
+                    self.or_imm(T2, T2, setbits, tmp)
+                em.ins(st, T2, ofs, b)
+                return T2
+            wide = not fits12(s32(~mask))           # merge_field uses shifts, which also mask
+            if base.index.k == 'const' or self.leafish(base.index):
+                self.gen(n, T1, True)               # value first, in T1
+                self.position(n, lo, w, o.inv, masked=not wide)
+                if base.index.k == 'const':
+                    b, ofs = self.arr_addr(base)    # GP / zero, or T0 after a LUI
+                    old = T2
+                else:
+                    b, ofs = self.arr_addr(base, T2)    # simple index: the address goes to T2
+                    old = T0
+                em.ins(ld, old, ofs, b)
+                self.merge_field(old, T1, lo, w)
+                em.ins(st, old, ofs, b)
+                return old
+            if self.leafish(n):                     # simple value: address first, then the value in T2
+                b, ofs = self.arr_addr(base)
+                self.gen(n, T2, True)
+                self.position(n, lo, w, o.inv, T2, masked=not wide)
+                em.ins(ld, T0, ofs, b)
+                self.merge_field(T0, T2, lo, w)
+                em.ins(st, T0, ofs, b)
+                return T0
+            self.gen(n, T1, True)                   # index and value both computed:
+            self.position(n, lo, w, o.inv)
+            self.push(T1)                           # the value waits on the stack
+            b, ofs = self.arr_addr(base)
+            em.ins(ld, T2, ofs, b)
+            self.and_not(T2, T2, mask, T0)
+            self.pop(T0)
+            em.ins('or', T2, T2, T0)
+            em.ins(st, T2, ofs, b)
+            return T2
         if base.kind not in ('ram', 'loc') or base.addr is None:
             raise RBError('bit and field assignment needs a register, RAM variable or device register')
         if base.readonly:
@@ -3261,6 +3358,8 @@ class Compiler:
         line, em.line = em.line, 0          # startup code has no source line
         em.head('startup')
         em.label('__start')
+        if self.has_irq:                    # a debugger reload keeps mstatus.MIE and pending
+            em.ins('csrrci', ZERO, CSRS['mstatus'], 8)  # interrupts: none before the program enables them
         em.li(SP, self.ram_base + self.ram_size)
         em.li(GP, self.gpval)
         em.li(T1, self.ram_base)
@@ -3415,6 +3514,8 @@ class Compiler:
                     raise RBError("'%s' is not a register" % rt.val)
                 if r in (ZERO, SP, GP, T0, T1, T2):
                     raise RBError('%s cannot hold a variable' % rt.val)
+                if r == TP and self.has_irq:
+                    raise RBError('TP is reserved for the interrupt return in programs with ON IRQ')
                 if 'E' in self.ext and r > 15:
                     raise RBError('register %s does not exist on RV32E' % rt.val)
                 if r == RA:
@@ -4819,6 +4920,11 @@ class Compiler:
         frame = 4 * len(regs)
         lines = ['__trap:', 'addi sp, sp, -%d' % frame]
         lines += ['sw %s, %d(sp)' % (ABI[r], 4 * j) for j, r in enumerate(regs)]
+        # Return without mret (some cores, e.g. the MicroBlaze V MCS, execute mret and ecall as
+        # no-ops): the return address goes to TP, MIE is set, then 'jr tp'. An interrupt taken
+        # just before that jump has all registers restored already: it continues at TP.
+        lines += ['csrr t1, mepc', 'la t2, __trap_jump', 'bne t1, t2, __trap_go',
+                  'csrw mepc, tp', '__trap_go:']
         lines += ['csrr t1, mcause', 'bgez t1, __trap_exc', 'slli t1, t1, 1', 'srli t1, t1, 1']
         for n, lab in sorted(self.irq.items()):
             lines += ['li t2, %d' % n, 'bne t1, t2, __trap_n%d' % n, 'jal ra, %s' % lab,
@@ -4826,7 +4932,8 @@ class Compiler:
         lines += ['j __trap_ret', '__trap_exc:', 'csrr t1, mepc', 'addi t1, t1, 4',
                   'csrw mepc, t1', '__trap_ret:']
         lines += ['lw %s, %d(sp)' % (ABI[r], 4 * j) for j, r in enumerate(regs)]
-        lines += ['addi sp, sp, %d' % frame, 'mret']
+        lines += ['addi sp, sp, %d' % frame, 'csrr tp, mepc', 'csrsi mstatus, 8',
+                  '__trap_jump:', 'jr tp']
         em.head('trap dispatcher')
         em.align4()                 # mtvec needs a 4-byte aligned address
         start = em.mark()
@@ -4837,7 +4944,7 @@ class Compiler:
 
     def listing(self):
         em = self.em
-        out = ['; RiscBasic %s listing: %s' % (VERSION, self.fname),
+        out = ['; ' + h for h in HEADER] + [';', '; RiscBasic %s listing: %s' % (VERSION, self.fname),
                '; TARGET %s   CODE 0x%08X size %d   RAM 0x%08X size %d   GP = 0x%08X'
                % (self.target, em.base, self.code_size, self.ram_base or 0, self.ram_size, self.gpval)]
         if 'C' in self.ext:
