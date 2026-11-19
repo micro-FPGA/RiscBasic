@@ -292,6 +292,7 @@ FUNCTION GetKey AS WORD
   END IF
   IF KeyHit() THEN
     INPUT CHR kc
+    IF kc = 3 THEN Fail 9           ' KEY in a loop must not swallow Ctrl-C
     RETURN kc
   END IF
   RETURN 0
