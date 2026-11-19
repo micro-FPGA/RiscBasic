@@ -10,6 +10,7 @@ Language design: Antti Lukats (Identor #1). Compiler: Claude (Identor #9). 10 No
 - `mem2elf.py`: converts a `.mem` file into an ELF executable
 - `tests/run_tests.py`: the test suite
 - `tests/check_gnu.py`: cross-check against the GNU RISC-V toolchain (objdump, objcopy, readelf)
+- `tools/litex2bas.py`: makes the include file for a LiteX SoC, see [LiteX.md](LiteX.md) (`tests/check_litex.py` checks it)
 - `docs/RiscBasic-Reference-Manual.docx` / `.pdf`: the reference manual
 - `docs/make_manual.py`: builds the manual (`python docs/make_manual.py --pdf`; needs python-docx, and Word on Windows for the PDF)
 
