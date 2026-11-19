@@ -550,8 +550,8 @@ P('A program can be pasted into the terminal as text, one line per program line,
   'msec/line).')
 H2('Stopping a program')
 P('**Ctrl-C** stops a running program with `? Break in line n`. It is checked at every line, at every '
-  'jump (`GOTO`, `NEXT`, `IF`, ...), while `DELAY` waits and while `LIST` prints. It does not interrupt '
-  '`INPUT`, which waits for its line.')
+  'jump (`GOTO`, `NEXT`, `IF`, ...), while `DELAY` waits, while `LIST` prints and while `INPUT` waits for its '
+  'line. At the `>` prompt Ctrl-C discards the line being typed.')
 H2('Memory')
 P('Each program line takes its text plus 4 bytes. `PRINT FREE` shows how much is left; when the '
   'program space is full, a new line is refused with `? Out of memory`.')

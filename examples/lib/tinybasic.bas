@@ -106,6 +106,8 @@ DIM gv AS WORD
 DIM gc AS BYTE
 DIM bc AS BYTE
 DIM kc AS BYTE
+DIM rl AS BYTE
+DIM rch AS BYTE
 DIM op AS WORD IN S9
 DIM ax AS SWORD IN S7
 DIM ay AS SWORD IN S8
@@ -294,6 +296,35 @@ FUNCTION GetKey AS WORD
   END IF
   RETURN 0
 END FUNCTION
+
+' Read a line into lbuf with echo and backspace; Ctrl-C breaks, also out of a running INPUT
+SUB ReadLine
+  ocol = 1                          ' a prompt is on the line
+  rl = 0
+  DO
+    IF kbuf <> 0 THEN                 ' a key typed while the program ran
+      rch = kbuf AND 255
+      kbuf = 0
+    ELSE
+      INPUT CHR rch
+    END IF
+    IF rch = 3 THEN Fail 9
+    IF rch = 13 THEN EXIT DO
+    IF rch = 8 OR rch = 127 THEN
+      IF rl > 0 THEN
+        rl = rl - 1
+        PRINT 8, 32, 8
+      END IF
+    ELSEIF rch >= 32 AND rl < LMAX THEN
+      lbuf(rl) = rch
+      rl = rl + 1
+      PRINT CHR rch
+    END IF
+  LOOP
+  lbuf(rl) = 0
+  PRINT 13, 10
+  ocol = 0
+END SUB
 
 ' ---------------------------------------------------------------- expressions
 
@@ -624,9 +655,8 @@ SUB DoInput
       IF P(tptr) = ";" OR P(tptr) = "," THEN tptr = tptr + 1
     END IF
     ir = GetRef()
-    LINE INPUT "? ", lbuf
-    PRINT 13, 10
-    ocol = 0
+    PRINT "? "
+    ReadLine
     SetRef ir, VAL(lbuf)
     SkipSp
     IF P(tptr) <> "," THEN EXIT DO
@@ -930,8 +960,8 @@ DO
   ocol = 0
   gsp = 0                           ' a stopped program leaves no FOR or GOSUB behind
   fsp = 0
-  LINE INPUT "> ", lbuf
-  PRINT 13, 10
+  PRINT "> "
+  ReadLine
   mq = 0                            ' upper case outside of quotes
   mi = 0
   WHILE lbuf(mi) <> 0
