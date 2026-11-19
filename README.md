@@ -13,6 +13,8 @@ A BASIC-like language for RISC-V soft cores, compiled directly to machine code: 
   - [i2c_detect.bas](examples/i2c_detect.bas): I2C bus scan that prints the address map like Linux `i2cdetect -y`
   - [MAC_EEPROM.bas](examples/MAC_EEPROM.bas): reads the 6-byte MAC address from an I2C EEPROM with `READ` / `WRITE`
   - [spi_read_id.bas](examples/spi_read_id.bas): reads the JEDEC ID (`9F`) and the manufacturer / device ID (`90`) of an SPI flash with bit-banged SPI
+  - [litex_hello.bas](examples/litex_hello.bas): `PRINT` and `INPUT` on a [LiteX](https://github.com/enjoy-digital/litex) SoC, in simulation or on a board (Trenz TEL0025): see [RiscBasic on a LiteX SoC](docs/LiteX.md)
+  - [litex_timer_irq.bas](examples/litex_timer_irq.bas): timer interrupt on a LiteX SoC with the VexRiscv CPU
 
 ```
 python source/riscbasic.py program.bas     # writes program.bin .hex .mem .lst .elf
