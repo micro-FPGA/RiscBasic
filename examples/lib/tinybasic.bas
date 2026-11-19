@@ -918,6 +918,7 @@ DIM mi AS WORD
 DIM mn AS WORD
 DIM mq AS BYTE
 
+pend = 0                            ' no program: pend is a register, not cleared at start
 rseed = &H92D6_8CA2
 PRINT 13, 10, "RiscBasic Tiny BASIC, ", DEC PTOP, " bytes free", 13, 10
 ASM
