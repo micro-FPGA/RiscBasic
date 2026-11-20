@@ -592,7 +592,8 @@ T(['Function', 'Result'], [
     ['`ABS(x)`', 'absolute value of x'],
     ['`RND(n)`', 'a pseudo-random number from 1 to n; n must be at least 1'],
     ['`PEEK(addr)`', 'the 32-bit word at address addr (memory or a device register)'],
-    ['`KEY`', 'the code of a key pressed on the terminal, or 0 if none: does not wait'],
+    ['`KEY`', 'the code of a key pressed on the terminal, or 0 if none: does not wait. '
+              'Ctrl-C is never returned, it stops the program'],
     ['`FREE`', 'bytes left for program lines'],
 ], [3.4, 13.0])
 SESSION('PRINT ABS(-9), ABS(9)\nPRINT RND(6), RND(6), RND(6), RND(100)')
@@ -763,6 +764,21 @@ block(g, 'Terminal')
 H2('LED counter on the TEG1015 board')
 CODE('10 REM COUNT ON THE FOUR LEDS, CTRL-C STOPS\n20 FOR I = 0 TO 15\n30 POKE &HF8015004, I\n'
      '40 DELAY 300\n50 NEXT I\n60 GOTO 20')
+H2('LED rotate on the TEG1015 board')
+P('`examples/tinybasic/leds.bas` runs a light over the four LEDs, either round (1, 2, 4, 8, 1, ...) '
+  'or back and forth (1, 2, 4, 8, 4, 2, ...). The keys are read with `KEY` while it runs, so the '
+  'program reacts without waiting:')
+with open(os.path.join(EXAMPLES, 'tinybasic', 'leds.bas')) as f:
+    LEDS = f.read()
+CODE(LEDS)
+T(['Key', 'Effect'], [
+    ['`+`', 'faster: halves the delay (100 ms at the start), down to 6 ms'],
+    ['`-`', 'slower: doubles the delay, up to 1600 ms'],
+    ['space', 'switches between rotate and bounce'],
+    ['Ctrl-C', 'stops the program; the LEDs keep their last pattern'],
+], [3.4, 13.0])
+P('`N` is the number of LEDs and `T` the bit of the last one, so the program works for other '
+  'LED counts too. For a board with the LEDs at another address, change `G` in line 20.')
 
 # ---- 8 Inside
 H1('How it works')
@@ -772,6 +788,7 @@ T(['File', 'Contents'], [
     ['`examples/tinybasic_sapphire.bas`', 'Memory layout and console for the Efinix Sapphire SoC.'],
     ['`examples/include/CPU/SAPPHIRE.bas`', 'Sapphire target, GPIO and UART devices.'],
     ['`examples/tinybasic/guess.bas`', 'Demo program, to paste into the terminal.'],
+    ['`examples/tinybasic/leds.bas`', 'LED rotate demo for the TEG1015 board.'],
     ['`docs/make_tinybasic_manual.py`', 'Builds this manual and runs its examples in the simulator.'],
 ], [6.4, 10.0])
 H2('Program storage')
